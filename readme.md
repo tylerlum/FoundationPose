@@ -166,7 +166,7 @@ Open the printed Viser URL in a browser. The viewer shows the RGB-D point cloud,
 
 The pose JSON can be the output from `extract_poses.py` (`poses_cam`/`poses_robot`) or a raw list of poses. By default, `--pose_key auto` selects `poses_cam`, then `poses_world`, then `poses_robot` when present.
 
-**Options:** `--pose_key auto|poses_cam|poses_robot|poses_world`, `--port` (8081), `--dt` (0.0333), `--start_idx` (0), `--point_cloud_stride` (1), `--point_cloud_subsample` (1), `--max_depth_m` (5.0), `--mesh_opacity <float>`, `--show_point_cloud/--no-show_point_cloud`
+**Options:** `--pose_key auto|poses_cam|poses_robot|poses_world`, `--port` (8081), `--dt` (0.0333), `--start_idx` (0), `--point_cloud_stride` (1), `--point_cloud_subsample` (1), `--max_depth_m` (5.0), `--mesh_opacity <float>`, `--mesh_scale` (1.0), `--show_point_cloud/--no-show_point_cloud`
 
 For camera-frame data, `visualize.py` uses the identity transform by default so FoundationPose `poses_cam` and RGB-D points appear in the camera frame. To visualize in another world frame, edit `T_W_C` near the top of `visualize.py`.
 

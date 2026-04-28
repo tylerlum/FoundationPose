@@ -65,6 +65,9 @@ class Args:
     mesh_opacity: Optional[float] = None
     """Optional mesh opacity."""
 
+    mesh_scale: float = 1.0
+    """Uniform scale factor applied to mesh vertices after loading."""
+
     axes_length: float = 0.08
     """Length of visualized camera/object axes."""
 
@@ -239,9 +242,12 @@ def main() -> None:
 
     mesh = None
     if args.mesh_path is not None:
+        if args.mesh_scale <= 0.0:
+            raise ValueError("mesh_scale must be > 0")
         mesh = trimesh.load(args.mesh_path, process=False)
         if isinstance(mesh, trimesh.Scene):
             mesh = mesh.dump(concatenate=True)
+        mesh.apply_scale(args.mesh_scale)
 
     print(f"video_dir: {args.video_dir}")
     print(f"mesh_path: {args.mesh_path}")
