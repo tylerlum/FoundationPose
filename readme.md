@@ -1,6 +1,6 @@
 # FoundationPose (SimToolReal Fork)
 
-Fork of [NVlabs/FoundationPose](https://github.com/NVlabs/FoundationPose) adapted for the [SimToolReal](https://simtoolreal.github.io/) perception pipeline. This repo provides four user-facing scripts for recording RGB-D videos, extracting 6D object poses, visualizing tracked poses, and running real-time pose tracking with ROS.
+Fork of [NVlabs/FoundationPose](https://github.com/NVlabs/FoundationPose) adapted for the [SimToolReal](https://simtoolreal.github.io/) perception pipeline. This repo provides four user-facing scripts for recording RGB-D videos, visualizing RGB-D/mesh/pose data, extracting 6D object poses, and running real-time pose tracking with ROS.
 
 ## Installation
 
@@ -121,7 +121,62 @@ recordings/<timestamp>/
 
 **Options:** `--width` (960), `--height` (540), `--exposure` (25), `--gain` (40), `--camera_upsidedown`
 
-### Script 2: Extract Poses
+### Script 2: Visualize RGB-D, Meshes, and Poses
+
+Use `visualize.py` before running FoundationPose to sanity-check the RGB-D data, camera intrinsics, mesh scale, and coordinate conventions. The viewer runs a local Viser web server and shows the RGB-D point cloud, camera frame, optional object mesh, and optional object poses.
+
+First check the RGB-D frames and `cam_K.txt` alone:
+
+```bash
+python visualize.py \
+    --video_dir recordings/<timestamp>/
+```
+
+Then add a mesh without poses to check scale and rough placement. Without a pose JSON, the mesh is placed at the image-center ray and median first-frame depth; this is only for scale/orientation sanity checks, not a predicted pose.
+
+```bash
+python visualize.py \
+    --video_dir recordings/<timestamp>/ \
+    --mesh_path /path/to/object.obj
+```
+
+If the mesh appears too small or too large, use a temporary scale factor:
+
+```bash
+python visualize.py \
+    --video_dir recordings/<timestamp>/ \
+    --mesh_path /path/to/object.obj \
+    --mesh_scale 20
+```
+
+After pose extraction, inspect poses without a mesh to verify trajectory and coordinate frames:
+
+```bash
+python visualize.py \
+    --video_dir recordings/<timestamp>/ \
+    --pose_json_path outputs/<run>/poses.json
+```
+
+Finally, visualize RGB-D, mesh, and poses together:
+
+```bash
+python visualize.py \
+    --video_dir recordings/<timestamp>/ \
+    --mesh_path /path/to/object.obj \
+    --pose_json_path outputs/<run>/poses.json
+```
+
+Open the printed Viser URL in a browser. Use the frame controls to play, pause, step through frames, and toggle the object or point cloud.
+
+The pose JSON can be the output from `extract_poses.py` (`poses_cam`/`poses_robot`) or a raw list of poses. By default, `--pose_key auto` selects `poses_cam`, then `poses_world`, then `poses_robot` when present.
+
+If RGB and depth image sizes differ, `visualize.py` prints a warning and resizes RGB to the depth image size before constructing the point cloud. Depth and `cam_K.txt` are treated as the authoritative geometry.
+
+**Options:** `--pose_key auto|poses_cam|poses_robot|poses_world`, `--port` (8081), `--dt` (0.0333), `--start_idx` (0), `--point_cloud_stride` (1), `--point_cloud_subsample` (1), `--max_depth_m` (5.0), `--mesh_opacity <float>`, `--mesh_scale` (1.0), `--show_point_cloud/--no-show_point_cloud`
+
+For camera-frame data, `visualize.py` uses the identity transform by default so FoundationPose `poses_cam` and RGB-D points appear in the camera frame. To visualize in another world frame, edit `T_W_C` near the top of `visualize.py`.
+
+### Script 3: Extract Poses
 
 Extract 6D object poses from a recorded RGB-D video and an object mesh.
 
@@ -134,6 +189,8 @@ python extract_poses.py \
 ```
 
 On the first frame, an interactive window opens where you click 4 corners of a bounding box around the object for SAM-based segmentation. FoundationPose then tracks the object through all frames. To skip interactive selection and use a pre-existing mask, pass `--mask_path <mask.png>`.
+
+If RGB, depth, and mask image sizes differ, `extract_poses.py` prints warnings, resizes RGB to the depth image size, and resizes masks to the depth image size with nearest-neighbor interpolation. As in the visualizer, depth and `cam_K.txt` are treated as the authoritative geometry.
 
 **Output format** (`poses.json`):
 ```json
@@ -149,26 +206,7 @@ On the first frame, an interactive window opens where you click 4 corners of a b
 }
 ```
 
-**Options:** `--mask_path <mask.png>` (skip interactive SAM), `--est_refine_iter` (5), `--track_refine_iter` (2), `--debug` (0/1/2)
-
-### Script 3: Visualize Recorded Poses
-
-Visualize recorded RGB-D frames, object poses, and an optional object mesh in an interactive Viser web viewer.
-
-```bash
-python visualize.py \
-    --video_dir recordings/<timestamp>/ \
-    --mesh_path /path/to/object.obj \
-    --pose_json_path poses.json
-```
-
-Open the printed Viser URL in a browser. The viewer shows the RGB-D point cloud, camera frame, object frame, and mesh. Use the frame controls to play, pause, step through frames, and toggle the object or point cloud.
-
-The pose JSON can be the output from `extract_poses.py` (`poses_cam`/`poses_robot`) or a raw list of poses. By default, `--pose_key auto` selects `poses_cam`, then `poses_world`, then `poses_robot` when present.
-
-**Options:** `--pose_key auto|poses_cam|poses_robot|poses_world`, `--port` (8081), `--dt` (0.0333), `--start_idx` (0), `--point_cloud_stride` (1), `--point_cloud_subsample` (1), `--max_depth_m` (5.0), `--mesh_opacity <float>`, `--mesh_scale` (1.0), `--show_point_cloud/--no-show_point_cloud`
-
-For camera-frame data, `visualize.py` uses the identity transform by default so FoundationPose `poses_cam` and RGB-D points appear in the camera frame. To visualize in another world frame, edit `T_W_C` near the top of `visualize.py`.
+**Options:** `--mask_path <mask.png>` (skip interactive SAM), `--est_refine_iter` (5), `--track_refine_iter` (2), `--debug` (0/1/2), `--show_window`, `--max_initial_candidates <int>`, `--max_pose_batch <int>`
 
 ### Script 4: Live Tracking with ROS
 

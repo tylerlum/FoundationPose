@@ -15,14 +15,15 @@ import yaml
 
 
 class FoundationPose:
-  def __init__(self, model_pts, model_normals, symmetry_tfs=None, mesh=None, scorer:ScorePredictor=None, refiner:PoseRefinePredictor=None, glctx=None, debug=0, debug_dir='/home/bowen/debug/novel_pose_debug/'):
+  def __init__(self, model_pts, model_normals, symmetry_tfs=None, mesh=None, scorer:ScorePredictor=None, refiner:PoseRefinePredictor=None, glctx=None, debug=0, debug_dir='/home/bowen/debug/novel_pose_debug/', rotation_grid_min_n_views=40, rotation_grid_inplane_step=60, max_initial_candidates=None):
     self.gt_pose = None
     self.ignore_normal_flip = True
     self.debug = debug
+    self.max_initial_candidates = max_initial_candidates
     self.debug_dir = debug_dir
     os.makedirs(debug_dir, exist_ok=True)
     self.reset_object(model_pts, model_normals, symmetry_tfs=symmetry_tfs, mesh=mesh)
-    self.make_rotation_grid(min_n_views=40, inplane_step=60)
+    self.make_rotation_grid(min_n_views=rotation_grid_min_n_views, inplane_step=rotation_grid_inplane_step)
 
     self.glctx = glctx
 
@@ -117,6 +118,8 @@ class FoundationPose:
     logging.info(f"rot_grid:{rot_grid.shape}")
     rot_grid = mycpp.cluster_poses(30, 99999, rot_grid, self.symmetry_tfs.data.cpu().numpy())
     rot_grid = np.asarray(rot_grid)
+    if self.max_initial_candidates is not None:
+      rot_grid = rot_grid[:self.max_initial_candidates]
     logging.info(f"after cluster, rot_grid:{rot_grid.shape}")
     self.rot_grid = torch.as_tensor(rot_grid, device='cuda', dtype=torch.float)
     logging.info(f"self.rot_grid: {self.rot_grid.shape}")
@@ -290,5 +293,4 @@ class FoundationPose:
       extra['vis'] = vis
     self.pose_last = pose
     return (pose@self.get_tf_to_centered_mesh()).data.cpu().numpy().reshape(4,4)
-
 

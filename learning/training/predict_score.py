@@ -114,8 +114,9 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
 
 
 class ScorePredictor:
-  def __init__(self, amp=True):
+  def __init__(self, amp=True, max_pose_batch=None):
     self.amp = amp
+    self.max_pose_batch = max_pose_batch
     self.run_name = "2024-01-11-20-02-45"
 
     model_name = 'model_best.pth'
@@ -162,6 +163,27 @@ class ScorePredictor:
     @rgb: np array (H,W,3)
     '''
     logging.info(f"ob_in_cams:{ob_in_cams.shape}")
+    if self.max_pose_batch is not None and len(ob_in_cams)>self.max_pose_batch:
+      if get_vis:
+        raise NotImplementedError("get_vis is not supported with max_pose_batch")
+      scores = []
+      for b in range(0, len(ob_in_cams), self.max_pose_batch):
+        scores_cur, _ = self.predict(
+          rgb=rgb,
+          depth=depth,
+          K=K,
+          ob_in_cams=ob_in_cams[b:b+self.max_pose_batch],
+          normal_map=normal_map,
+          get_vis=False,
+          mesh=mesh,
+          mesh_tensors=mesh_tensors,
+          glctx=glctx,
+          mesh_diameter=mesh_diameter,
+        )
+        scores.append(scores_cur)
+        torch.cuda.empty_cache()
+      return torch.cat(scores, dim=0), None
+
     ob_in_cams = torch.as_tensor(ob_in_cams, dtype=torch.float, device='cuda')
 
     logging.info(f'self.cfg.use_normal:{self.cfg.use_normal}')
@@ -223,4 +245,3 @@ class ScorePredictor:
       return scores, canvas
 
     return scores, None
-

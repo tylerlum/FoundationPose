@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -173,8 +174,17 @@ def load_rgb_depth_points(
     K: np.ndarray,
     args: Args,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    rgb = np.array(Image.open(rgb_path).convert("RGB"))
+    rgb_image = Image.open(rgb_path).convert("RGB")
     depth = np.array(Image.open(depth_path)) / 1000.0
+    if rgb_image.size != (depth.shape[1], depth.shape[0]):
+        logging.warning(
+            "RGB/depth size mismatch for %s: rgb=%s depth=%s; resizing RGB to depth size",
+            rgb_path.name,
+            (rgb_image.height, rgb_image.width),
+            depth.shape[:2],
+        )
+        rgb_image = rgb_image.resize((depth.shape[1], depth.shape[0]), Image.Resampling.BILINEAR)
+    rgb = np.array(rgb_image)
     return depth_to_points(
         depth_m=depth,
         K=K,
