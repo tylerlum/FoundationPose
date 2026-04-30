@@ -101,8 +101,10 @@ print_step() {
 
 foundationpose() {
     cd "${FOUNDATIONPOSE_REPO}"
+    set +u
     eval "$("${CONDA_EXE}" shell.bash hook)"
     conda activate "${CONDA_ENV}"
+    set -u
     export PYTHONPATH="${FOUNDATIONPOSE_REPO}:${PYTHONPATH:-}"
     "$@"
 }
