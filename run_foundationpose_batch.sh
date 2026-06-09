@@ -9,6 +9,7 @@ MESH_ROOT="${MESH_ROOT:-/home/tylerlum/github_repos/sam-3d-objects/2026-04-30_me
 OUTPUT_ROOT="${OUTPUT_ROOT:-${FOUNDATIONPOSE_REPO}/2026-04-30_pose_outputs}"
 TASK_GLOB="${TASK_GLOB:-*}"
 MASK_GLOB="${MASK_GLOB:-*masks*}"
+EXCLUDE_TASKS="${EXCLUDE_TASKS:-}"
 MAX_INITIAL_CANDIDATES="${MAX_INITIAL_CANDIDATES:-48}"
 DEBUG="${DEBUG:-0}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
@@ -27,6 +28,7 @@ Options:
   --output-root PATH     Local output root for pose JSONs
   --task-glob GLOB       Task folder glob under DATA_ROOT, default: *
   --mask-glob GLOB       Mask folder glob inside each task, default: *masks*
+  --exclude-tasks LIST   Comma or space separated task names to skip
   --debug N              FoundationPose debug level, default: 0. Use 1 to write vis.mp4.
   --max-candidates N     Initial pose candidate cap, default: 48
   --no-skip-existing     Re-run tasks even if poses.json already exists
@@ -62,6 +64,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --mask-glob)
             MASK_GLOB="$2"
+            shift 2
+            ;;
+        --exclude-tasks)
+            EXCLUDE_TASKS="$2"
             shift 2
             ;;
         --debug)
@@ -126,6 +132,19 @@ sanitize_name() {
     printf '%s' "${raw}" | tr -cs '[:alnum:]_-' '_'
 }
 
+task_is_excluded() {
+    local task_name="$1"
+    local excluded
+
+    for excluded in ${EXCLUDE_TASKS//,/ }; do
+        if [[ "${task_name}" == "${excluded}" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 find_mask_dir_for_object() {
     local task_dir="$1"
     local object_name="$2"
@@ -149,7 +168,14 @@ find_mask_dir_for_object() {
 
 first_mask_file() {
     local masks_dir="$1"
-    find "${masks_dir}" -maxdepth 1 -type f -name '*.png' | sort | head -1
+    local mask_files=()
+
+    mapfile -t mask_files < <(find "${masks_dir}" -maxdepth 1 -type f -name '*.png' | sort)
+    if [[ "${#mask_files[@]}" -eq 0 ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "${mask_files[0]}"
 }
 
 run_one() {
@@ -219,6 +245,10 @@ job_count=0
 for task_dir in "${DATA_ROOT}"/${TASK_GLOB}; do
     [[ -d "${task_dir}" ]] || continue
     task_name="$(basename "${task_dir}")"
+    if task_is_excluded "${task_name}"; then
+        echo "Skipping excluded task: ${task_name}"
+        continue
+    fi
     mesh_task_dir="${MESH_ROOT}/${task_name}"
     [[ -d "${mesh_task_dir}" ]] || {
         echo "Skipping ${task_name}: no mesh task dir at ${mesh_task_dir}"

@@ -217,7 +217,11 @@ def main() -> None:
     args = tyro.cli(Args)
 
     rgb_dir = args.video_dir / "rgb"
-    depth_dir = args.video_dir / "depth"
+    # depth_dir = args.video_dir / "depth"
+    # depth_dir = args.video_dir / "depth_fs"
+    # depth_dir = args.video_dir / "depth_ffs"
+    depth_dir = args.video_dir / "depth_gt"
+    # depth_dir = args.video_dir / "depth_fast"
     cam_intrinsics_path = args.video_dir / "cam_K.txt"
 
     if not rgb_dir.exists():
