@@ -327,8 +327,8 @@ def save_viz_data_2_objects(
     rgb_s = np.stack([rgb for rgb, _ in viz_log], axis=0)
     depth_s = np.stack([depth for _, depth in viz_log], axis=0)
     n = len(viz_log)
-    poses_1 = _pose_array(pose_log_1[:n])
-    poses_2 = _pose_array(pose_log_2[:n])
+    poses_1 = _pose_array(list(pose_log_1)[:n])
+    poses_2 = _pose_array(list(pose_log_2)[:n])
     ts = (
         np.asarray(timestamps, dtype=np.int64)
         if timestamps is not None

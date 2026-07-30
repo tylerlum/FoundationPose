@@ -18,10 +18,12 @@ ROS topics:
 """
 
 import argparse
+import math
 import os
 import re
 import sys
 import time
+from collections import deque as _deque
 from pathlib import Path
 
 
@@ -172,6 +174,24 @@ def _build_parser():
     parser.add_argument(
         "--save_dir", type=str, default="live_tracking_2_objects_results"
     )
+    parser.add_argument(
+        "--max_buffer_seconds",
+        type=float,
+        default=60.0,
+        help=(
+            "Keep only this many seconds of frames/poses in RAM before "
+            "dropping the oldest entries. 0 disables the cap."
+        ),
+    )
+    parser.add_argument(
+        "--max_buffer_frames",
+        type=int,
+        default=0,
+        help=(
+            "Exact frame buffer cap. 0 derives the cap from "
+            "--max_buffer_seconds and --fps."
+        ),
+    )
     parser.add_argument("--frame_id", type=str, default="camera_frame")
     parser.add_argument(
         "--duration",
@@ -312,10 +332,24 @@ def _load_robot_transform(args):
     return None
 
 
+def _buffer_frame_cap(args):
+    if args.max_buffer_frames > 0:
+        return int(args.max_buffer_frames)
+    if args.max_buffer_seconds <= 0:
+        return None
+    fps_for_cap = args.fps if args.fps > 0 else args.camera_fps
+    if fps_for_cap <= 0:
+        fps_for_cap = {"HD1080": 30, "HD720": 60, "VGA": 100}.get(
+            args.camera_resolution, 30
+        )
+    return max(1, int(math.ceil(args.max_buffer_seconds * fps_for_cap)))
+
+
 def main():
     parser = _build_parser()
     args = parser.parse_args()
     mesh_paths = _resolve_mesh_paths(args, parser)
+    buffer_frame_cap = _buffer_frame_cap(args)
 
     T_RC = _load_robot_transform(args)
     ros_pub = (
@@ -327,25 +361,34 @@ def main():
     )
 
     os.makedirs(args.save_dir, exist_ok=True)
-    raw_frames = []
-    pose_log_1 = []
-    pose_log_2 = []
-    frame_times = []
+    raw_frames = _deque(maxlen=buffer_frame_cap)
+    pose_log_1 = _deque(maxlen=buffer_frame_cap)
+    pose_log_2 = _deque(maxlen=buffer_frame_cap)
+    frame_times = _deque(maxlen=buffer_frame_cap)
     stage_times = {
-        "grab": [],
-        "depth": [],
-        "track_1": [],
-        "track_2": [],
-        "track_total": [],
-        "publish": [],
-        "total": [],
+        "grab": _deque(maxlen=buffer_frame_cap),
+        "depth": _deque(maxlen=buffer_frame_cap),
+        "track_1": _deque(maxlen=buffer_frame_cap),
+        "track_2": _deque(maxlen=buffer_frame_cap),
+        "track_total": _deque(maxlen=buffer_frame_cap),
+        "publish": _deque(maxlen=buffer_frame_cap),
+        "total": _deque(maxlen=buffer_frame_cap),
     }
-    viz_log = []
+    viz_log = _deque(maxlen=buffer_frame_cap)
+    if buffer_frame_cap is None:
+        print("[buffer] frame buffer cap disabled")
+    else:
+        print(f"[buffer] retaining newest {buffer_frame_cap} frames in RAM")
     K = None
     loop_start_time = None
     backend_tag = args.depth_backend
     capture = None
     interrupted = False
+
+    def _save_loop_start_time():
+        if buffer_frame_cap is not None and frame_times:
+            return time.time() - float(sum(frame_times))
+        return loop_start_time
 
     try:
         t_spawn = time.time()
@@ -478,8 +521,6 @@ def main():
 
         _logging.getLogger().setLevel(_logging.WARNING)
 
-        from collections import deque as _deque
-
         work_history = _deque(
             maxlen=max(30, int(args.fps) if args.fps > 0 else 30)
         )
@@ -551,10 +592,14 @@ def main():
                 work_history.append(work_elapsed)
                 fps_inst = 1.0 / max(work_elapsed, 1e-6)
                 fps_avg = len(work_history) / sum(work_history)
+                if buffer_frame_cap is None:
+                    buffer_count = f"{len(frame_times):4d}"
+                else:
+                    buffer_count = f"{len(frame_times):4d}/{buffer_frame_cap}"
                 print(
                     f"\r[fps] achieved inst={fps_inst:5.1f}  "
                     f"avg{len(work_history)}={fps_avg:5.1f}  "
-                    f"(cap={args.fps:.0f})  n={len(frame_times):4d}  ",
+                    f"(cap={args.fps:.0f})  n={buffer_count}  ",
                     end="",
                     flush=True,
                 )
@@ -574,7 +619,7 @@ def main():
                             pose_log_1=pose_log_1,
                             pose_log_2=pose_log_2,
                             K=K,
-                            loop_start_time=loop_start_time,
+                            loop_start_time=_save_loop_start_time(),
                             frame_times=frame_times,
                             stage_times=stage_times,
                             target_fps=args.fps,
@@ -672,7 +717,7 @@ def main():
                 pose_log_1=pose_log_1,
                 pose_log_2=pose_log_2,
                 K=K,
-                loop_start_time=loop_start_time,
+                loop_start_time=_save_loop_start_time(),
                 frame_times=frame_times,
                 stage_times=stage_times,
                 target_fps=args.fps,
@@ -702,7 +747,7 @@ def main():
                     ]
                     launch_viser_replay(
                         pc_log,
-                        pose_log_1,
+                        list(pose_log_1),
                         K,
                         mesh_path=mesh_paths[0],
                         T_RC=T_RC_DEFAULT,
