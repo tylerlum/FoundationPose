@@ -91,7 +91,11 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
 
 
 class PoseRefinePredictor:
-  def __init__(self,):
+  def __init__(self, trt_engine_path=None):
+    """If `trt_engine_path` is given, the refiner model.forward(A, B) is
+    replaced with a TensorRT runner returning the same dict-of-tensors
+    output. The PyTorch model is still constructed (predict() touches
+    self.cfg, etc.) but its forward is bypassed by the swap below."""
     logging.info("welcome")
     self.amp = True
     self.run_name = "2023-10-28-18-33-37"
@@ -141,6 +145,24 @@ class PoseRefinePredictor:
     self.model.load_state_dict(ckpt)
 
     self.model.cuda().eval()
+
+    if trt_engine_path is not None:
+      # Lazy import: only pull in tensorrt + cuda-python when actually used.
+      import sys as _sys
+      _sys.path.insert(0, f'{code_dir}/../..')
+      from fp_trt_runner import TrtRefinerRunner
+      logging.info(f"loading TRT refiner engine: {trt_engine_path}")
+      self.trt_runner = TrtRefinerRunner(trt_engine_path).cuda().eval()
+      # Drop-in replacement: predict() calls `self.model(A, B)`. By making
+      # self.model the TRT runner (an nn.Module with forward(A,B) -> dict),
+      # the rest of predict() is unchanged.
+      self.model = self.trt_runner
+      # No need to wrap in autocast -- the engine is fp16 internally and
+      # returns fp32. Disable amp at the call site by setting self.amp = False.
+      self.amp = False
+    else:
+      self.trt_runner = None
+
     logging.info("init done")
     self.last_trans_update = None
     self.last_rot_update = None
