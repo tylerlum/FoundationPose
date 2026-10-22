@@ -624,7 +624,7 @@ class ZedCaptureProcess:
 # already import them from here keep working.
 
 
-def save_viz_data(run_dir, viz_log, pose_log, K, stride, mesh_path,
+def save_viz_data(run_dir, viz_log, pose_log, K, stride, mesh_path, compress=True,
                   timestamps=None):
     """Stash the strided RGB/depth + poses + intrinsics into
     `viz_data.npz` inside `run_dir`, so the run can be replayed in viser
@@ -645,7 +645,10 @@ def save_viz_data(run_dir, viz_log, pose_log, K, stride, mesh_path,
     ts = (np.asarray(timestamps, dtype=np.int64)
           if timestamps is not None else np.zeros(n, dtype=np.int64))
     path = os.path.join(run_dir, 'viz_data.npz')
-    np.savez_compressed(
+    # savez_compressed costs 3.83 s where savez costs 0.09 s (42x) for
+    # only 12% more bytes -- not a good trade inside a live loop.
+    _savez = np.savez_compressed if compress else np.savez
+    _savez(
         path,
         rgb=rgb_s, depth=depth_s, poses=poses,
         K=np.asarray(K, dtype=np.float64),
@@ -686,9 +689,24 @@ def _stage_stats_ms(times):
 
 def save_run(save_dir, backend_name, resolution,
              raw_frames, pose_log, K, loop_start_time, frame_times,
-             target_fps, stage_times=None):
-    """Write `raw.mp4` + `overlay.mp4` into a fresh datetimed subdir of
-    `save_dir` and print loop-timing stats. Returns the run directory."""
+             target_fps, stage_times=None,
+             encode_preset=None, encode_crf=None, write_overlay=True):
+    """Write raw.mp4 + overlay.mp4 into a fresh datetimed subdir of
+    save_dir and print loop-timing stats. Returns the run directory.
+
+    encode_preset
+        x264 preset. None keeps ffmpeg's default (medium), which is what this
+        function always used. Measured on 400 frames of 960x540: default
+        4.15 s, veryfast 0.80 s (5.2x faster), ultrafast 0.29 s (14x). Two
+        videos are written per take, so this dominates save latency.
+    encode_crf
+        Use -crf N rate control instead of imageio's quality=8. x264 does not
+        honour the qscale that quality= maps to, which is why the files come
+        out enormous (200 MB for a short take). CRF fixes size and speed at
+        once.
+    write_overlay
+        Skip overlay.mp4. It is reconstructible from raw.mp4 plus the poses.
+    """
     if not raw_frames or loop_start_time is None:
         return None
 
@@ -702,17 +720,30 @@ def save_run(save_dir, backend_name, resolution,
     raw_path = os.path.join(run_dir, 'raw.mp4')
     overlay_path = os.path.join(run_dir, 'overlay.mp4')
 
+    _enc = {'macro_block_size': 1}
+    _params = []
+    if encode_preset:
+        _params += ['-preset', str(encode_preset)]
+    if encode_crf is not None:
+        _params += ['-crf', str(encode_crf)]
+    else:
+        _enc['quality'] = 8
+    if _params:
+        _enc['output_params'] = _params
+
     raw_writer = imageio.get_writer(raw_path, fps=measured_fps,
-                                    codec='libx264', quality=8,
-                                    macro_block_size=1)
+                                    codec='libx264', **_enc)
     for f in raw_frames:
         raw_writer.append_data(f)
     raw_writer.close()
 
-    overlay_writer = imageio.get_writer(overlay_path, fps=measured_fps,
-                                        codec='libx264', quality=8,
-                                        macro_block_size=1)
-    for rgb_frame, pose in zip(raw_frames, pose_log):
+    overlay_writer = None
+    if write_overlay:
+        overlay_writer = imageio.get_writer(overlay_path, fps=measured_fps,
+                                            codec='libx264', **_enc)
+    else:
+        overlay_path = '(skipped)'
+    for rgb_frame, pose in (zip(raw_frames, pose_log) if overlay_writer else ()):
         if pose is None or K is None:
             overlay_writer.append_data(rgb_frame)
             continue
@@ -725,7 +756,8 @@ def save_run(save_dir, backend_name, resolution,
         cv2.arrowedLine(overlay, o, py, (0, 255, 0), 3, cv2.LINE_AA)
         cv2.arrowedLine(overlay, o, pz, (0, 0, 255), 3, cv2.LINE_AA)
         overlay_writer.append_data(overlay)
-    overlay_writer.close()
+    if overlay_writer is not None:
+        overlay_writer.close()
 
     print(f'Saved: {raw_path} and {overlay_path} '
           f'({len(raw_frames)} frames @ {measured_fps} FPS over {elapsed:.2f}s)')

@@ -8,18 +8,57 @@ several seconds and a GPU context to load and aren't needed for replay.
 Everything here is pure-Python / numpy / trimesh / viser / socket.
 """
 
+import os
 import time
-from pathlib import Path  # noqa: F401  (kept for downstream callers)
+from pathlib import Path
 
 import numpy as np
 
 
-# Default camera->robot transform, copied verbatim from
-# /juno/u/kedia/FoundationPose/live_tracking_with_ros_reset.py (the third/last
-# T_RC assignment in that script, which is the active one — the two preceding
-# matrices there are overwritten before use). Used to map a camera-frame object
-# pose into the robot frame: robot_pose = T_RC_DEFAULT @ cam_pose.
-T_RC_DEFAULT = np.array([
+# Default camera->robot transform, used to map a camera-frame object pose into
+# the robot frame: robot_pose = T_RC_DEFAULT @ cam_pose. Since 13 Oct 2026 it is
+# read from the station repo (github.com/tylerlum/kuka_sharpa_station), which
+# keeps every calibration, dated, and the one in use as calibrations/current.txt:
+# a camera move is a commit there, not an edit here. KUKA_SHARPA_STATION points
+# at its clone; by default the clone sits next to this repo: next to this
+# FoundationPose checkout, or next to depthbasedRL when this folder is its
+# third_party/FoundationPose.
+def _default_station_dir():
+    here = Path(__file__).resolve().parent
+    candidates = [here.parent / 'kuka_sharpa_station', here.parents[2] / 'kuka_sharpa_station']
+    for c in candidates:
+        if c.is_dir():
+            return c
+    return candidates[0]
+
+
+STATION_DIR = Path(os.environ.get('KUKA_SHARPA_STATION', _default_station_dir()))
+T_RC_FILE = STATION_DIR / 'calibrations' / 'current.txt'
+
+# Used only when T_RC_FILE is missing: the 13 Oct 2026 viser calibration
+# (the station repo's calibrations/2026-10-13_1918_viser.txt).
+T_RC_BUILTIN = np.array([
+    [-0.40178874053474328, -0.11760770567462986,  0.90814879592798803, -0.35799999999999998],
+    [-0.91441628899472904,  0.10467816465046974, -0.39100553994351189, -0.57300000000000006],
+    [-0.04907808472844947, -0.98752767526351326, -0.14960090971658008,  0.72049999999999992],
+    [ 0.00000000000000000,  0.00000000000000000,  0.00000000000000000,  1.00000000000000000],
+])
+
+
+def _load_T_RC():
+    if T_RC_FILE.is_file():
+        return np.loadtxt(T_RC_FILE).reshape(4, 4)
+    print(f'[live_tracking_replay] WARNING: no {T_RC_FILE}; using the built-in T_RC '
+          '(13 Oct 2026). Clone github.com/tylerlum/kuka_sharpa_station next to this '
+          'repo, or set KUKA_SHARPA_STATION.', flush=True)
+    return T_RC_BUILTIN.copy()
+
+
+T_RC_DEFAULT = _load_T_RC()
+
+# The calibration from /juno/u/kedia/FoundationPose/live_tracking_with_ros_reset.py,
+# in use until the camera moved on 13 Oct 2026.
+T_RC_BEFORE_20261013 = np.array([
     [ 0.95627894385143042, -0.17782179758182126,  0.23218524899563026, -0.49520504226664308],
     [-0.28556601086548311, -0.39643057160653450,  0.87252212312014887, -1.44857156913606078],
     [-0.06310812138518884, -0.90067874972183481, -0.42987806970668574,  1.03018932829980048],
@@ -56,6 +95,22 @@ def _free_port():
     with socket.socket() as s:
         s.bind(('', 0))
         return s.getsockname()[1]
+
+
+def first_free_port(start, tries=50):
+    """The first port from `start` up that nothing is listening on, so a script's viser URL stays the same from
+    one run to the next (each script has its own `start`). A port left in TIME_WAIT by the last run counts as
+    free. Falls back to any free port."""
+    import socket
+    for port in range(int(start), int(start) + tries):
+        with socket.socket() as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(('', port))
+                return port
+            except OSError:
+                continue
+    return _free_port()
 
 
 def launch_viser_replay(pc_log, pose_log, K, mesh_path=None,

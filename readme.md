@@ -1,5 +1,8 @@
 # FoundationPose (SimToolReal Fork)
 
+> **Branch `2026-10-21_RobotTrackers_bohg-ws-16`:** the trackers, live views, replay and camera calibration that
+> run on the robot's perception PC. Start at [ROBOT_TRACKERS.md](ROBOT_TRACKERS.md).
+
 Fork of [NVlabs/FoundationPose](https://github.com/NVlabs/FoundationPose) adapted for the [SimToolReal](https://simtoolreal.github.io/) perception pipeline. This repo provides four user-facing scripts for recording RGB-D videos, visualizing RGB-D/mesh/pose data, extracting 6D object poses, and running real-time pose tracking with ROS.
 
 ## Installation

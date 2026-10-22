@@ -162,6 +162,29 @@ def click_box_points(
     return None
 
 
+
+
+# SAM is reloaded on every call otherwise. from_pretrained() re-reads the
+# checkpoint off disk and re-uploads it to the GPU each time, which shows up
+# as a multi-second "loading weights" stall on every re-register (r), and
+# leaves the previous copy for the allocator to mop up. The weights never
+# change within a run, so cache them per (model id, device).
+_SAM_CACHE = {}
+
+
+def _load_sam(segmenter_id: str, device: str):
+    key = (segmenter_id, device)
+    if key not in _SAM_CACHE:
+        import time as _time
+        _t0 = _time.time()
+        model = AutoModelForMaskGeneration.from_pretrained(segmenter_id).to(device)
+        model.eval()
+        proc = AutoProcessor.from_pretrained(segmenter_id)
+        _SAM_CACHE[key] = (model, proc)
+        print(f"[sam] loaded {segmenter_id} on {device} in "
+              f"{_time.time() - _t0:.2f}s (cached for this process)", flush=True)
+    return _SAM_CACHE[key]
+
 def segment_with_box(
     image: Image.Image,
     box: BoundingBox,
@@ -173,8 +196,7 @@ def segment_with_box(
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     segmenter_id = segmenter_id if segmenter_id is not None else "facebook/sam-vit-base"
-    segmentator = AutoModelForMaskGeneration.from_pretrained(segmenter_id).to(device)
-    processor = AutoProcessor.from_pretrained(segmenter_id)
+    segmentator, processor = _load_sam(segmenter_id, device)
     
     # Prepare inputs with only the box
     input_boxes = [[box.xyxy]]

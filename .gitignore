@@ -159,3 +159,8 @@ run_used.yml
 
 videos/
 human_videos/
+
+# From the bohg-ws-16 tracker tree (21 Oct 2026)
+mycpp/build/
+live_tracking_results/
+live_tracking_2_objects_results/

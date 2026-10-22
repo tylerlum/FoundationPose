@@ -90,7 +90,14 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
 
 
 class PoseRefinePredictor:
-  def __init__(self, max_pose_batch=None):
+  def __init__(self, max_pose_batch=None, trt_engine_path=None):
+    """`max_pose_batch` (from the batch pipeline, extract_poses.py) crops and refines at most that many poses at a
+    time to bound GPU memory; None = all at once (the live trackers).
+
+    If `trt_engine_path` is given, the refiner model.forward(A, B) is
+    replaced with a TensorRT runner returning the same dict-of-tensors
+    output. The PyTorch model is still constructed (predict() touches
+    self.cfg, etc.) but its forward is bypassed by the swap below."""
     logging.info("welcome")
     self.amp = True
     self.max_pose_batch = max_pose_batch
@@ -141,6 +148,24 @@ class PoseRefinePredictor:
     self.model.load_state_dict(ckpt)
 
     self.model.cuda().eval()
+
+    if trt_engine_path is not None:
+      # Lazy import: only pull in tensorrt + cuda-python when actually used.
+      import sys as _sys
+      _sys.path.insert(0, f'{code_dir}/../..')
+      from fp_trt_runner import TrtRefinerRunner
+      logging.info(f"loading TRT refiner engine: {trt_engine_path}")
+      self.trt_runner = TrtRefinerRunner(trt_engine_path).cuda().eval()
+      # Drop-in replacement: predict() calls `self.model(A, B)`. By making
+      # self.model the TRT runner (an nn.Module with forward(A,B) -> dict),
+      # the rest of predict() is unchanged.
+      self.model = self.trt_runner
+      # No need to wrap in autocast — the engine is fp16 internally and
+      # returns fp32. Disable amp at the call site by setting self.amp = False.
+      self.amp = False
+    else:
+      self.trt_runner = None
+
     logging.info("init done")
     self.last_trans_update = None
     self.last_rot_update = None
@@ -232,7 +257,8 @@ class PoseRefinePredictor:
 
           B_in_cam = egocentric_delta_pose_to_pose(pose_data.poseA[b:b+bs], trans_delta=trans_delta, rot_mat_delta=rot_mat_delta)
           B_next.append(B_in_cam)
-        torch.cuda.empty_cache()
+        if self.max_pose_batch is not None:
+          torch.cuda.empty_cache()
 
       B_in_cams = torch.cat(B_next, dim=0).reshape(len(ob_in_cams),4,4)
 
@@ -296,3 +322,4 @@ class PoseRefinePredictor:
       return B_in_cams_out, canvas
 
     return B_in_cams_out, None
+

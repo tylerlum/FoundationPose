@@ -1,4 +1,7 @@
 # PyTorch
+# (bohg-ws-16, the robot's perception PC, runs these trackers on torch 2.7 + cu126 in a venv that also has
+#  Isaac Sim, with unpinned scipy / scikit-*, and no torch pin; see docs/bohg-ws-16/LIVE_TRACKING_RUNBOOK.md.
+#  The pins below are the standalone FoundationPose install.)
 --extra-index-url https://download.pytorch.org/whl/cu118
 torch==2.0.0+cu118
 torchvision==0.15.1+cu118

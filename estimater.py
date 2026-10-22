@@ -7,6 +7,7 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 
+import tempfile
 from Utils import *
 import itertools
 from learning.training.predict_score import *
@@ -65,7 +66,13 @@ class FoundationPose:
     self.mesh_path = None
     self.mesh = mesh
     if self.mesh is not None:
-      self.mesh_path = f'/tmp/{uuid.uuid4()}.obj'
+      # Upstream wrote /tmp/<uuid>.obj. The .obj name is unique, but trimesh
+      # writes its sidecar material files alongside it under FIXED names
+      # (material_0.png, material.mtl), which collide with another user's
+      # copies in the shared /tmp and raise PermissionError on any multi-user
+      # box. Give each instance its own directory (honours $TMPDIR).
+      self.mesh_path = os.path.join(
+          tempfile.mkdtemp(prefix='fp_mesh_'), f'{uuid.uuid4()}.obj')
       self.mesh.export(self.mesh_path)
     self.mesh_tensors = make_mesh_tensors(self.mesh)
 
