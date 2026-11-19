@@ -14,10 +14,15 @@ declare -A CFG=(
   [sam2_iou_reregister]="--sam2_tool"
   [recommended]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor"
   [recommended_anchorxy]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --fpp_anchor_xy"
+  [v4_oldprompt]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --sam2_simple_prompt"
+  [v8]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --arbitrate color --flip_check_every 3 --lost_max_cooldown_s 2"
+  [v8_filter]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --arbitrate color --flip_check_every 3 --lost_max_cooldown_s 2 --fpp_filter --fpp_filter_alpha 0.8"
 )
-for name in plain sam2_iou_reregister recommended recommended_anchorxy; do
+# RT=1 (or 0.5 when the GPU is shared): replay skips frames like the live camera ("pretend live"); RT unset/0 =
+# every frame in order (sequential, simplest). CONFIGS="plain v8" picks a subset. --log_checks logs colour/appearance.
+for name in ${CONFIGS:-plain recommended v4_oldprompt v8 v8_filter}; do
   out=$TAKE/compare/$name; rm -rf "$out"; mkdir -p "$out"
-  taskset -c 0-9,12-31 python "$FP/live_tracking_robust_2_objects.py" --replay_dir "$TAKE/replay" --mask_mode replay \
+  taskset -c 0-9,12-31 python "$FP/live_tracking_robust_2_objects.py" --replay_dir "$TAKE/replay" --replay_realtime_scale ${RT:-0} --log_checks --mask_mode replay \
     --headless --no_auto_record --mesh_path $M/red_brush/red_brush.obj --mesh_path_2 $M/cube_29mm_gold.obj \
     --object_name_2 cube_29mm --upright_meshes cube_29mm_gold --save_dir "$out" ${CFG[$name]} > "$out/log.txt" 2>&1
   echo "$name exit $?"
