@@ -1,7 +1,7 @@
 #!/bin/bash
 # bash run_configs.sh TAKE_NAME [replay|replay_gtdepth] [config ...]   -> runs/<take>[_gt]/<config>/<take dir>
 S=$(cd "$(dirname "$0")" && pwd); R=${FPSIM_ROOT:-$S}
-FP=/home/tylerlum/github_repos/depthbasedRL/third_party/FoundationPose
+FP=${FP_DIR:-/home/tylerlum/github_repos/depthbasedRL/third_party/FoundationPose}
 PY=/home/tylerlum/github_repos/depthbasedRL/.venv/bin/python
 M=/juno/u/tylerlum/tracking_meshes_20261026
 TAKE=$1; RP=${2:-replay}; shift; shift
@@ -16,9 +16,12 @@ declare -A CFG=(
   [v8b]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --arbitrate color --flip_check_every 3 --lost_max_cooldown_s 2"
   [v8kf]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --arbitrate color --flip_check_every 3 --lost_max_cooldown_s 2 --fpp_filter --fpp_filter_alpha 0.8"
   [v8kfb]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --arbitrate color --flip_check_every 3 --lost_max_cooldown_s 2 --fpp_filter --fpp_filter_alpha 0.8"
+  [v4np]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor"
+  [v4npb]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor"
+  [rec]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --log_checks"
   [v4_sync]="--sam2_tool --sam2_image_size 640 --sam2_every 2 --lost_metric cover --lost_try_anchor"
 )
-suffix=""; [ "$RP" = replay_gtdepth ] && suffix=_gt; [ -n "$RT" ] && suffix="${suffix}_rt"
+suffix=""; [ "$RP" = replay_gtdepth ] && suffix=_gt; [ -n "$RT" ] && [ "$RT" != "0" ] && suffix="${suffix}_rt"
 for name in $CFGS; do
   out=$R/runs/$TAKE$suffix/$name; rm -rf "$out"; mkdir -p "$out"
   cd $FP && $PY live_tracking_robust_2_objects.py --replay_dir "$R/takes/$TAKE/$RP" --replay_realtime_scale ${RT:-0} --mask_mode replay \

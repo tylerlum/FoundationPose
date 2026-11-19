@@ -1,0 +1,193 @@
+<title>Held-Brush Tracker Lab</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@500;600&display=swap">
+<link rel="stylesheet" href="style.css">
+
+<div class="wrap">
+  <div class="eyebrow">FoundationPose tracker · sweep cell · 19 Nov 2026</div>
+  <h1>Held-Brush Tracker Lab</h1>
+  <p class="sub">What we tried for keeping the red brush tracked while the Sharpa hand holds it, how it was tested (MuJoCo + real takes), what works, what does not, and what to run next.</p>
+  <ul class="toc">
+    <li><a href="#bottom-line">Bottom line</a></li><li><a href="#asks">Your asks</a></li><li><a href="#bench">Sim bench</a></li>
+    <li><a href="#trackers">Tracker results</a></li><li><a href="#sam">SAM2 vs SAM3</a></li><li><a href="#colour">Colour check</a></li>
+    <li><a href="#cameras">Cameras</a></li><li><a href="#kalman">Kalman filter</a></li><li><a href="#speed">Speed</a></li>
+    <li><a href="#logging">Logging &amp; replay</a></li><li><a href="#code">Code</a></li><li><a href="#next">Next steps</a></li>
+  </ul>
+
+  <h2 id="bottom-line">Bottom line</h2>
+  <div class="callout">
+    <h3>Run live now: v4 + new SAM2 prompt, with logging</h3>
+    <p>In sim (8 held-brush takes, frames skipped like the live camera), v4 with the new SAM2 prompt keeps 56–60% of frames within 2 cm, against 27% for old FoundationPose and 30% for yesterday's v4, and it recovers in 5 of 8 takes (old FoundationPose: 1 of 8). It uses no colour thresholds, so nothing in it depends on sim calibration. The verified speed edits halve <code>track_one</code> (31 → 15 ms per object) with bitwise-identical poses and are already in the repo.</p>
+<pre><code>cd /home/tylerlum/github_repos/depthbasedRL
+python third_party/FoundationPose/live_tracking_robust_2_objects.py &lt;your usual flags&gt; \
+  --sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 \
+  --lost_metric cover --lost_try_anchor --log_checks --save_depth</code></pre>
+  </div>
+  <div class="callout stop">
+    <h3>Do not run v8 (colour arbitration) live yet</h3>
+    <p>v8 is best in sim, but its colour check compares the image with the mesh texture. On real takes a correctly tracked brush scores 0.28–0.31 (sim 0.07) and a pose stuck on the orange KUKA link scores the same. Its thresholds would fire on good frames and miss the KUKA failure. A colour model learned from the real first frame separates them much better (see <a href="#colour">Colour check</a>); it is logged by <code>--log_checks</code> so we can calibrate it on your next rollouts.</p>
+  </div>
+  <div class="callout warn">
+    <h3>Biggest open problems</h3>
+    <ul>
+      <li>Even at rest on the table, the real brush pose looks a few cm off: the rendered outline extends past the real brush. Check that the mesh matches the real brush (its handle is black in reality, red in the mesh).</li>
+      <li>Re-registration blocks the loop for 0.6–1.0 s; a moving brush can be far away when tracking restarts.</li>
+      <li>Sim is a stress test, not the real thing: kinematic grasp, plain background, perfect stereo rectification. Real rollouts with <code>--save_depth</code> are the next evidence.</li>
+    </ul>
+  </div>
+
+  <h2 id="asks">Your asks, and their status</h2>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Ask</th><th>Status</th><th>Result / where</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">Does the FoundationPose++ idea work, is it fast, better than baseline?</th><td><span class="pill done">done, tested</span></td><td>Built a MuJoCo bench. FP++'s per-frame tricks hurt; what helps is SAM2 as a watchdog + a fixed SAM2 prompt (+ the colour referee in sim). See <a href='#trackers'>Tracker results</a>.</td></tr>
+      <tr><th scope="row">Test the full ROS pipeline with a fake robot, objects, physics and rendering in MuJoCo; compare with old FoundationPose</th><td><span class="pill done">done, tested</span></td><td>Private roscore, all 7 topics every frame, scored in the robot frame. Old FP vs v4 vs v8 on 8 takes.</td></tr>
+      <tr><th scope="row">&quot;v4 barely helps&quot;: does it help or not?</th><td><span class="pill done">done, tested</span></td><td>Yesterday's v4: 30% of frames within 2 cm vs 27% for old FP. With the new SAM2 prompt: 56–60%.</td></tr>
+      <tr><th scope="row">SAM3 vs SAM2: speed and tracking quality</th><td><span class="pill done">done, tested</span></td><td>SAM3 tracker 80 ms vs SAM2 13 ms; with the same prompt, same quality. <a href='#sam'>Details</a>.</td></tr>
+      <tr><th scope="row">Side-by-side RGB + mask videos for SAM2 / SAM3</th><td><span class="pill done">done, tested</span></td><td>Real takes 164617, 173827 and two sim takes, on this page and in <code>/juno/u/tylerlum/kuan_handoff_20261119/sam2_vs_sam3_videos/</code>.</td></tr>
+      <tr><th scope="row">Is the box prompt only at the start? Does it matter later?</th><td><span class="pill done">answered</span></td><td>Only at (re)starts, but it defines the object for all later frames: mask IoU 0.25 → 0.85 from the prompt alone. Fixed (new default).</td></tr>
+      <tr><th scope="row">Did we already have a Kalman filter on orientation? Tune it?</th><td><span class="pill done">done, tested</span></td><td>Yes (constant velocity on translation + rotation vector). Better start pose offline, no gain in the full tracker. Keep off.</td></tr>
+      <tr><th scope="row">Are we basically doing FoundationPose++?</th><td><span class="pill done">answered</span></td><td>No: FoundationPose tracks unchanged; SAM2 watches; re-register only when a referee says it is wrong; 180° flip test.</td></tr>
+      <tr><th scope="row">Best camera pose: current front-on vs previous diagonal</th><td><span class="pill done">done, tested</span></td><td>Front-on is best in sim (71% vs 53–57%). <a href='#cameras'>Cameras</a>.</td></tr>
+      <tr><th scope="row">Two cameras (ZED1 + ZED2 front or diagonal): gains, compute</th><td><span class="pill part">partly</span></td><td>Sim gains small (ZED1 +0.6%; diagonal ZED2 +4%, upper bound +11%). Compute cost estimated (2× depth + tracking), not measured live.</td></tr>
+      <tr><th scope="row">Object origin is not at the object centre</th><td><span class="pill done">answered</span></td><td>FoundationPose tracks about the mesh centre internally and converts back; our checks compare like with like. No change needed.</td></tr>
+      <tr><th scope="row">Is the colour check suspicious?</th><td><span class="pill done">done, tested</span></td><td>Yes: unsafe on real takes (good poses 0.28–0.31, KUKA-link failure scores the same). Learned-appearance check is better and now logged.</td></tr>
+      <tr><th scope="row">Re-registration is slow; what if the robot keeps moving?</th><td><span class="pill part">partly</span></td><td>Measured 0.57–0.98 s; tracking restarts from a stale pose. Fixes listed (worker thread, scorer TensorRT, catch-up track); not built yet.</td></tr>
+      <tr><th scope="row">Inference time of the colour and other checks</th><td><span class="pill done">done, tested</span></td><td>Colour 2 ms, silhouette 1.5 ms, depth fit 4 ms, flip check ~10–15 ms every 3rd frame.</td></tr>
+      <tr><th scope="row">In-hand reorientation: no fixed grasp offset</th><td><span class="pill part">partly</span></td><td>Agreed. Proposed a soft hand-distance check from joint states (brush must stay near the palm); not built.</td></tr>
+      <tr><th scope="row">How fast is SAM3 text re-detection; when does SAM lose the object?</th><td><span class="pill done">done, tested</span></td><td>271 ms. SAM rarely loses the brush (IoU &lt; 0.5 on 2/358 and 7/248 frames with the new prompt); its failure is spreading onto the hand after a bad prompt.</td></tr>
+      <tr><th scope="row">Tune colour thresholds from logged results</th><td><span class="pill part">partly</span></td><td>Done on existing real takes without depth (appearance check separates table vs KUKA failure). Needs your next --save_depth rollouts + good/bad labels.</td></tr>
+      <tr><th scope="row">Logging so you can replay real rollouts as live or in order (local only)</th><td><span class="pill done">done, tested</span></td><td><code>--save_depth --log_checks</code> + <code>compare_replay_configs.sh</code> (RT=0 / RT=0.5). Tested end to end through ROS in sim; not yet on a real camera recording.</td></tr>
+      <tr><th scope="row">SAM3 at 640 px, GPU preprocessing, torch.compile, TensorRT</th><td><span class="pill part">partly</span></td><td>Profiled (78 ms is compute-bound). 672 px is possible via config change (est. 22–35 ms), not tried; still slower than SAM2.</td></tr>
+      <tr><th scope="row">Look through FoundationPose / SAM2 / SAM3 code for speed-ups</th><td><span class="pill done">done, tested</span></td><td>Review done. 4 safe FoundationPose edits: bitwise-identical poses, track_one 31 → 15 ms per object. Now in the repo. Bigger items listed.</td></tr>
+      <tr><th scope="row">New 2026-11-19 branches, pushed so Kuan can see</th><td><span class="pill done">done, tested</span></td><td>tylerlum/FoundationPose <code>2026-11-19_TrackerSimBenchSamPrompt_bohg-ws-16</code>. depthbasedRL has no remote.</td></tr>
+      <tr><th scope="row">Where to share (depthbasedRL remote? simtoolreal_dev?)</th><td><span class="pill done">answered</span></td><td>Use the FoundationPose fork. I can create a private GitHub repo for depthbasedRL if you say so.</td></tr>
+      <tr><th scope="row">&quot;gh auth login&quot; in the status bar</th><td><span class="pill done">answered</span></td><td>Claude Code's PR-status footer; unrelated. gh says you are logged in; <code>! gh auth refresh</code> should clear it.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="bench">The sim bench</h2>
+  <p>MuJoCo scene of the sweep cell: iiwa14 + Sharpa hand holding the red brush (kinematic grasp, curled fingers), 29 mm gold cube under physics, table at the measured 0.540 m, rendered from the calibrated camera with its real intrinsics at 960×540. Depth is the live tracker's own Fast-FS TensorRT engine run on a rendered stereo pair (12 cm baseline), so it blurs thin parts like the real one. Brush speeds are capped at the real p95 (0.9 m/s, 350°/s). The unchanged tracker replays each take; <code>--replay_realtime_scale 0.5</code> skips frames like the live camera would (the replay runs ~2× slower than live because the live tracker shares the GPU). Every true frame is scored with the newest pose the tracker had published, which is what the policy sees.</p>
+  <figure><img src="sim_strip.jpg" alt="Four frames of the occlusion_tour sim take: hand holding the red brush in different poses above the table with the gold cube"><figcaption>occlusion_tour, one of 8 takes (3 designed, 5 held-out random paths through the most occluded reachable grasp poses). Full ROS path was also run on a private roscore (port 11411): every frame published on all 7 topics.</figcaption></figure>
+
+  <h2 id="trackers">Tracker results (current ZED2 view, 8 takes)</h2>
+  <p>"Frames within 2 cm" uses ADD (mean distance of mesh points). "Lost" is ADD &gt; 5 cm. "Recovered" means the last half second is within 2 cm.</p>
+  <div id="main-table" class="needs-data"></div>
+  <h3>Error over time</h3>
+  <div id="curves" class="needs-data"></div>
+  <h3>Per take (frames within 2 cm; ✗ = still lost at the end)</h3>
+  <div id="per-take" class="needs-data"></div>
+  <p class="small muted">Identical configs vary run to run (SAM2 runs asynchronously and timing changes which frames are skipped). Compare averages over takes and repeats, not single cells.</p>
+
+  <h2 id="sam">SAM2 vs SAM3, and the prompt bug</h2>
+  <p>The prompt is given only when SAM is (re)started: at registration and whenever the tracker re-seeds it. SAM then tracks from its memory of that first mask, so the prompt decides what "the object" is for every later frame. With the old prompt (mask box + 1 point) on a held brush, the box also covers the hand, and both SAM2 and SAM3 track arm + hand + brush. Your tests looked perfect because the first prompt was given with the brush on the table.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Tracker · prompt</th><th>ms / frame</th><th>Mask IoU with true visible brush (median, 2 hard takes)</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">SAM2 at 640 px · box + 1 point (old)</th><td class="num">13</td><td class="num neg">0.25–0.38</td></tr>
+      <tr><th scope="row">SAM2 at 640 px · box + 4 positive + 6 negative points (new default)</th><td class="num">13</td><td class="num pos">0.82–0.91</td></tr>
+      <tr><th scope="row">SAM3 tracker · box + 1 point</th><td class="num">80</td><td class="num neg">0.25–0.38</td></tr>
+      <tr><th scope="row">SAM3 tracker · mask prompt</th><td class="num">80</td><td class="num pos">0.88–0.95</td></tr>
+      <tr><th scope="row">SAM3 text detection ("red brush"), one frame</th><td class="num">271</td><td class="muted">for re-acquiring after a loss</td></tr>
+    </tbody>
+  </table></div>
+  <div class="grid2">
+    <figure><img src="sam_prompt_old.jpg" alt="SAM2 with the old prompt: green mask covers the whole robot arm, hand and brush"><figcaption>Old prompt: SAM2 takes the arm, hand and brush.</figcaption></figure>
+    <figure><img src="sam_prompt_new.jpg" alt="SAM2 with the new prompt: green mask covers only the brush"><figcaption>New prompt: brush only. Magenta = true visible brush.</figcaption></figure>
+  </div>
+  <figure><video src="real_164617_sam2_vs_sam3.mp4" controls muted playsinline preload="metadata" poster="real_164617_f100.jpg"></video><figcaption>Real take 164617 (hand covers the brush at ~2 s). Top: SAM2 old / new prompt. Bottom: SAM3 box+point / mask prompt. Around frame 100 the old prompt spreads onto the fingers.</figcaption></figure>
+  <figure><video src="sim_occlusion_tour_sam2_vs_sam3.mp4" controls muted playsinline preload="metadata" poster="sam_prompt_new.jpg"></video><figcaption>Sim occlusion_tour, same four panels, with the true visible brush in magenta and IoU per panel.</figcaption></figure>
+  <p><strong>Why SAM3 is slow, and is it worth optimizing?</strong> Its image encoder is a 32-layer ViT at 1008 px (466 M parameters, ~6.6 TFLOP per frame); 78 ms is already near the GPU's limit, and preprocessing is only 1.4 ms. torch.compile or TensorRT might reach 55–65 ms. Running it at 672 px is possible by changing <code>config.image_size</code> (estimated 22–35 ms) but unverified for accuracy on thin parts. Even then it stays ≥2× slower than SAM2 for a small mask gain. Use SAM3 for text re-detection after a confirmed loss; keep SAM2 for tracking.</p>
+
+  <h2 id="colour">The colour check (you were right to doubt it)</h2>
+  <p>v7/v8 render the textured mesh at the tracked pose and compare it with the image. In sim this separates right from wrong poses well (right ≈ 0.07, more than 5 cm off 0.23–0.41) because the sim brush <em>is</em> the mesh texture. On real takes it does not:</p>
+  <figure><img src="real_render.jpg" alt="Real brush on the table, the mesh texture rendered at the tracked pose, and the tracked outline extending below the real brush"><figcaption>Real take 173734, frame 0: the mesh texture is much darker than the real brush and its handle is red where the real one is black; the tracked outline also extends past the real brush.</figcaption></figure>
+  <div id="real-chart" class="needs-data"></div>
+  <p>The alternative learns the brush's colours from the real first frames (hue × saturation histogram plus a dark bin) and measures how far the pixels under the tracked pose drift from it. On the table it stays 0.00–0.15, and the brush stuck on the KUKA link reads 0.55–0.79. Correctly held frames read 0.26–0.36 in this test only because these takes have no saved depth, so the fingers covering the brush could not be excluded. <code>--log_checks</code> logs it occlusion-aware, so your next <code>--save_depth</code> rollouts give the real thresholds.</p>
+
+  <h2 id="cameras">Camera pose, and two cameras</h2>
+  <figure><img src="cameras.jpg" alt="The same instant rendered from the current front-on ZED2, the previous diagonal ZED2 and ZED1"><figcaption>The same instant from the three calibrated poses. ZED1 sits close to the arm, so the held brush often leaves the top of its image.</figcaption></figure>
+  <div id="cam-table" class="needs-data"></div>
+  <p>Keep the current front-on ZED2. With v8 it keeps 71% of frames within 2 cm, against 53–57% from the previous diagonal pose and 25–27% from ZED1. All three see the brush less than 60% visible about equally often (14–15% of frames); the diagonal view sees it smaller (8.6k vs 11.8k pixels), and from ZED1 the held brush often leaves the top of the image. ZED1's pose is the 16 Oct calibration; if that camera has moved, its result does not apply.</p>
+  <h3>Two cameras</h3>
+  <p>Each camera runs its own tracker on the same motion; per frame we take one camera's pose in the robot frame. "Colour selector" picks the camera with the lower logged colour error (sim-optimistic, see above); "oracle" always picks the better one and is the upper bound.</p>
+  <div id="twocam-table" class="needs-data"></div>
+  <p>Adding ZED1 gives almost nothing (71.5% vs 70.9%). A second ZED2 at the diagonal pose helps more (74.8% with the selector, 82.3% upper bound), but it doubles depth and tracking work on the one GPU, and its selector uses the sim-only colour check. With the speed edits there may be room for it later; it is not the first thing to do.</p>
+
+  <h2 id="kalman">Kalman filter</h2>
+  <p>We have a constant-velocity filter (<code>--fpp_filter</code>) on translation and rotation vector. It only changes the pose FoundationPose starts refining from; the published pose stays FoundationPose's. It now runs every frame, with <code>--fpp_filter_alpha</code>, <code>--fpp_filter_max_v</code>, <code>--fpp_filter_max_w</code>.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Test</th><th>No filter</th><th>Filter</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">Offline, true trajectories + FoundationPose-like jitter, 30 Hz: start-pose error p95</th><td class="num">26.7 mm · 7.7°</td><td class="num pos">11.7 mm · 4.1° (alpha 0.5)</td></tr>
+      <tr><th scope="row">Offline, 15 Hz (skipped frames): p95</th><td class="num">51.7 mm · 14.7°</td><td class="num pos">25.8 mm · 6.8° (alpha 0.8)</td></tr>
+      <tr><th scope="row">Closed loop, full tracker v8 + new prompt, 8 takes × 2: frames within 2 cm</th><td class="num">71.0% · 70.5%</td><td class="num">71.5% · 64.6%</td></tr>
+    </tbody>
+  </table></div>
+  <p>The better start pose does not carry through: the refiner already absorbs most of that error, and when the pose is wrong the filter extrapolates the wrong motion (one repeat collapsed on occlusion_tour). Keep it off. Tuning more would need many repeats to beat the run-to-run noise.</p>
+
+  <h2 id="speed">Speed</h2>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Step</th><th>Time</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">Fast-FS depth (TensorRT)</th><td class="num">~4 ms</td><td>already optimized</td></tr>
+      <tr><th scope="row">FoundationPose <code>track_one</code>, per object</th><td class="num">15–40 ms</td><td>only ~3–4 ms is GPU work; the rest is host overhead (≈30 syncs, CPU uint8→float, <code>empty_cache</code>)</td></tr>
+      <tr><th scope="row">SAM2 at 640 px</th><td class="num">13 ms</td><td>async thread, every 2nd frame</td></tr>
+      <tr><th scope="row">Colour check / silhouette / depth fit</th><td class="num">2 / 1.5 / 4 ms</td><td>not the bottleneck</td></tr>
+      <tr><th scope="row">Re-registration (252 hypotheses)</th><td class="num">0.57 s (2 iters) · 0.98 s (5)</td><td>blocks the loop; scorer is still PyTorch</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Verified today:</strong> the four safe edits (no per-call <code>empty_cache</code>, uint8 upload with GPU conversion, <code>pose_last</code> kept on the GPU, lazy logging in <code>register</code>) give <strong>bitwise-identical poses</strong> for both objects on two takes (289 and 358 frames), and cut <code>track_one</code> from 31.2 to 15.4 ms (brush) and 30.1 to 15.1 ms (cube); the replay loop went from 70.8 to 40.3 ms per frame (3 alternating runs each, GPU shared with the live tracker in both). They are now in depthbasedRL and on the fork branch.</p>
+  <h3>Code review: what to change next</h3>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Change</th><th>Expected saving</th><th>Risk</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">Drop per-call <code>torch.cuda.empty_cache()</code> (refiner, scorer)</th><td class="num">1–5 ms/frame</td><td>none · <span class="pill done">done in speedopt copy</span></td></tr>
+      <tr><th scope="row">Upload rgb once as uint8, convert on GPU; keep <code>pose_last</code> on GPU</th><td class="num">3–5 ms/frame</td><td>none · <span class="pill done">done in speedopt copy</span></td></tr>
+      <tr><th scope="row">Lazy logging in <code>register</code> (f-strings format 252-value GPU tensors)</th><td class="num">a few ms / register</td><td>none · <span class="pill done">done in speedopt copy</span></td></tr>
+      <tr><th scope="row">Cache K / crop constants, cut ~20 of ~30 syncs per <code>track_one</code></th><td class="num">1–3 ms/object</td><td>none</td></tr>
+      <tr><th scope="row">Refiner TensorRT plan with opt batch 252 for register</th><td class="num">10–40% of register refine</td><td>low</td></tr>
+      <tr><th scope="row">Scorer in TensorRT fp16</th><td class="num">40–60 ms / register</td><td>low–medium (near-tied scores)</td></tr>
+      <tr><th scope="row">Re-register in a worker thread / own stream</th><td class="num">removes the 0.6–1 s stall</td><td>medium</td></tr>
+      <tr><th scope="row">Both objects in one refiner call (batch 2)</th><td class="num">4–10 ms/frame (guess)</td><td>low</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Also found: the TensorRT refiner copies inputs on torch's stream but runs on its own stream without an event; safe today only because of default-stream semantics. Worth fixing with the stream change.</p>
+
+  <h2 id="logging">Logging &amp; replay (local only, for FoundationPose iteration)</h2>
+  <p>Nothing here uploads anywhere. Each take lands in <code>/home/tylerlum/kuan_takes/&lt;take&gt;/</code>.</p>
+  <ol class="steps">
+    <li><strong>Record</strong> with <code>--save_depth --log_checks</code>: writes <code>replay/</code> (rgb, depth, capture stamps, K, first-frame masks) and per-frame checks in <code>robust_log.json</code>.</li>
+    <li><strong>Re-run any config on it</strong>, either in order (simple) or pretending to be live (frames skipped by processing time):
+<pre><code>cd /home/tylerlum/github_repos/depthbasedRL
+CONFIGS="plain recommended v8" RT=0   bash third_party/FoundationPose/tools_sweep_20261118/compare_replay_configs.sh &lt;take&gt;
+CONFIGS="plain recommended v8" RT=0.5 bash third_party/FoundationPose/tools_sweep_20261118/compare_replay_configs.sh &lt;take&gt;</code></pre></li>
+    <li><strong>Tell me which seconds were good or bad</strong> (or I mark them from <code>overlay.mp4</code>); that labels the logged checks for threshold tuning.</li>
+  </ol>
+  <p><strong>Tested end to end</strong> on a sim take through the full ROS path (private roscore, recommended config + <code>--log_checks --save_depth</code>): all 7 topics every frame (brush 6.4 mm median error in the robot frame, cube 2.6 mm, payload valid 259/259); <code>replay/</code> written (258 frames); 129 frames of logged checks; then <code>compare_replay_configs.sh</code> re-ran plain / recommended / v8 on that saved take. Without ground truth its warning signs already separate them: plain put the brush below the table on 98 frames, recommended and v8 on none. Against the sim truth: plain 26% of frames within 2 cm, recommended 66%, v8 89%. Not yet run on a real camera recording, because the live tracker owns the camera.</p>
+
+  <h2 id="code">Code and branches</h2>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Repo</th><th>Branch</th><th>Shared?</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">tylerlum/FoundationPose (fork)</th><td><code>2026-11-19_TrackerSimBenchSamPrompt_bohg-ws-16</code></td><td class="pos">pushed; give Kuan this</td></tr>
+      <tr><th scope="row">depthbasedRL (local only, no git remote)</th><td><code>2026-11-19_TrackerSimBenchSamPrompt</code></td><td class="muted">bohg-ws-16 only</td></tr>
+      <tr><th scope="row">Speed edits (scratch copy, not committed)</th><td><code>/home/tylerlum/github_repos/FoundationPose_speedopt_20261119</code></td><td class="muted">to be ported after review</td></tr>
+    </tbody>
+  </table></div>
+  <p>Sim bench: <code>third_party/FoundationPose/tools_sweep_20261118/sim_mujoco/</code> (README inside). Videos for Kuan: <code>/juno/u/tylerlum/kuan_handoff_20261119/sam2_vs_sam3_videos/</code>.</p>
+
+  <h2 id="next">Next steps</h2>
+  <ol class="steps">
+    <li><strong>Restart the live tracker with the recommended command</strong> above (your call: it is your live process). It also picks up the speed edits.</li>
+    <li><strong>Record 5–10 held-brush rollouts</strong> with <code>--save_depth --log_checks</code>, and tell me roughly when tracking was good or bad. I replay all configs on them in order and live-like, and calibrate the learned-appearance thresholds.</li>
+    <li><strong>Check the brush mesh against the real brush</strong> (rest pose looks a few cm off; handle colour differs). If needed, rebuild it with SAM3D like the dustpan.</li>
+    <li><strong>v9 = v8 with the learned-appearance referee</strong> instead of mesh colour; test on the recorded takes before any live use.</li>
+    <li><strong>Make re-registration non-blocking</strong> (worker thread + catch-up track on the newest frame), then scorer in TensorRT. Publish "invalid" on the quality topic while re-registering.</li>
+    <li><strong>Soft hand-distance check</strong> from joint states: brush pose far from the palm while held = lost, and search near the hand when re-registering. Works with in-hand reorientation.</li>
+    <li><strong>SAM3 text re-detection</strong> (271 ms) for a fresh mask after a confirmed loss.</li>
+    <li><strong>Cameras</strong>: keep the front-on ZED2. Revisit a second (diagonal) ZED2 only after the above, since the sim gain is small.</li>
+  </ol>
+</div>
+<script src="app.js"></script>

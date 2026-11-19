@@ -4,6 +4,7 @@
 # Writes TAKE_DIR/compare/<config>/<take>/ and prints score_real_replay.py's table. Needs the drl env; no ROS, no camera.
 # Do not run while a live tracker is recording on the same GPU (it will slow both down).
 set -u
+PY=${PY:-$(command -v python || echo /home/tylerlum/github_repos/depthbasedRL/.venv/bin/python)}   # works without activating drl
 TAKE=$1
 TRC=${2:-/juno/u/tylerlum/camera_2_calibration_27432424/record_visual_20261118_172707/T_RC.txt}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -22,9 +23,9 @@ declare -A CFG=(
 # every frame in order (sequential, simplest). CONFIGS="plain v8" picks a subset. --log_checks logs colour/appearance.
 for name in ${CONFIGS:-plain recommended v4_oldprompt v8 v8_filter}; do
   out=$TAKE/compare/$name; rm -rf "$out"; mkdir -p "$out"
-  taskset -c 0-9,12-31 python "$FP/live_tracking_robust_2_objects.py" --replay_dir "$TAKE/replay" --replay_realtime_scale ${RT:-0} --log_checks --mask_mode replay \
+  taskset -c 0-9,12-31 $PY "$FP/live_tracking_robust_2_objects.py" --replay_dir "$TAKE/replay" --replay_realtime_scale ${RT:-0} --log_checks --mask_mode replay \
     --headless --no_auto_record --mesh_path $M/red_brush/red_brush.obj --mesh_path_2 $M/cube_29mm_gold.obj \
     --object_name_2 cube_29mm --upright_meshes cube_29mm_gold --save_dir "$out" ${CFG[$name]} > "$out/log.txt" 2>&1
   echo "$name exit $?"
 done
-python "$HERE/score_real_replay.py" "$TRC" "$TAKE" $TAKE/compare/*/*/
+$PY "$HERE/score_real_replay.py" "$TRC" "$TAKE" $TAKE/compare/*/2*/

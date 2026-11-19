@@ -193,7 +193,9 @@ class PoseRefinePredictor:
     if mesh_tensors is None:
       mesh_tensors = make_mesh_tensors(mesh_centered)
 
-    rgb_tensor = torch.as_tensor(rgb, device='cuda', dtype=torch.float)
+    # (speedopt) copy uint8 to the GPU, convert there (as_tensor(dtype=float) converts on the CPU, 4x the bytes)
+    rgb_tensor = (torch.from_numpy(np.ascontiguousarray(rgb)).cuda().float() if isinstance(rgb, np.ndarray)
+                  else torch.as_tensor(rgb, device='cuda', dtype=torch.float))
     depth_tensor = torch.as_tensor(depth, device='cuda', dtype=torch.float)
     xyz_map_tensor = torch.as_tensor(xyz_map, device='cuda', dtype=torch.float)
     trans_normalizer = self.cfg['trans_normalizer']
@@ -255,7 +257,8 @@ class PoseRefinePredictor:
       B_in_cams = torch.cat(B_in_cams, dim=0).reshape(len(ob_in_cams),4,4)
 
     B_in_cams_out = B_in_cams@torch.tensor(tf_to_center[None], device='cuda', dtype=torch.float)
-    torch.cuda.empty_cache()
+    # (speedopt 19 Nov) no torch.cuda.empty_cache() per call: it waits for the whole GPU (incl. SAM2's stream)
+    # and the memory is re-allocated on the next frame anyway.
     self.last_trans_update = trans_delta
     self.last_rot_update = rot_mat_delta
 

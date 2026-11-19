@@ -36,5 +36,7 @@ for d in sys.argv[2:]:
         cov = [r['cover'] for r in rows if isinstance(r.get('cover'), (int, float))]
     cm = f'{np.median(cov):9.2f}' if cov else f'{"-":>9s}'
     cl = f'{int(np.sum(np.array(cov) < 0.3)):9d}' if cov else f'{"-":>9s}'
-    print(f'{os.path.basename(d.rstrip("/"))[:60]:60s} {len(P):5d} {fps:5.1f} {int((v > 1).sum()):6d} {int((w > 400).sum()):8d} '
+    _parts = d.rstrip('/').split('/')
+    _name = ('compare: ' + _parts[-2]) if len(_parts) > 2 and _parts[-3] == 'compare' else 'original: ' + _parts[-1]
+    print(f'{_name[:60]:60s} {len(P):5d} {fps:5.1f} {int((v > 1).sum()):6d} {int((w > 400).sum()):8d} '
           f'{int(below.sum()):7d} {lost:5d} {fix:4d} {cm} {cl}')

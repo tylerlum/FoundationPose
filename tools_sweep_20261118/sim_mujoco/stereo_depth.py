@@ -19,15 +19,17 @@ fs = None
 for take in map(Path, sys.argv[1:]):
     rd = take / 'replay'
     K = np.loadtxt(rd / 'cam_K.txt')
-    if fs is None:
+    if fs is None or abs(fs.fx_fs - float(K[0, 0]) * fs.fs_size[0] / 960) > 1e-3:   # rebuild per camera (fx)
         fs = FastFsDepth(model_path=str(DEFAULT_FAST_FS_MODEL), iters=4, max_disp=192, baseline_m=0.12,
                          fp_size=(960, 540), fs_size=(384, 224), fx_fp=float(K[0, 0]), trt_dir=TRT)
     (rd / 'depth').mkdir(exist_ok=True)
     g = take / 'replay_gtdepth'
     (g / 'depth').mkdir(parents=True, exist_ok=True)
     for sub in ('rgb', 'masks_1', 'masks_2', 'cam_K.txt', 'ts_ns.txt'):
-        if not (g / sub).exists():
-            os.symlink(rd / sub, g / sub)
+        if os.path.lexists(g / sub) and not (g / sub).exists():
+            os.remove(g / sub)                      # broken relative link from an older version
+        if not os.path.lexists(g / sub):
+            os.symlink((rd / sub).resolve(), g / sub)
     errs = []
     files = sorted((rd / 'rgb').glob('*.png'))
     for f in files:

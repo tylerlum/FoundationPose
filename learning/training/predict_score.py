@@ -173,7 +173,8 @@ class ScorePredictor:
     if mesh_tensors is None:
       mesh_tensors = make_mesh_tensors(mesh)
 
-    rgb = torch.as_tensor(rgb, device='cuda', dtype=torch.float)
+    rgb = (torch.from_numpy(np.ascontiguousarray(rgb)).cuda().float() if isinstance(rgb, np.ndarray)
+           else torch.as_tensor(rgb, device='cuda', dtype=torch.float))   # (speedopt) convert on the GPU
     depth = torch.as_tensor(depth, device='cuda', dtype=torch.float)
 
     pose_data = make_crop_data_batch(self.cfg.input_resize, ob_in_cams, mesh, rgb, depth, K, crop_ratio=self.cfg['crop_ratio'], glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, cfg=self.cfg, mesh_diameter=mesh_diameter)
@@ -213,7 +214,7 @@ class ScorePredictor:
     scores = scores_global
 
     logging.info(f'forward done')
-    torch.cuda.empty_cache()
+    # (speedopt 19 Nov) no torch.cuda.empty_cache() per call
 
     if get_vis:
       logging.info("get_vis...")

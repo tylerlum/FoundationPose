@@ -219,7 +219,8 @@ class FoundationPose:
     poses[:,:3,3] = torch.as_tensor(center.reshape(1,3), device='cuda')
 
     add_errs = self.compute_add_err_to_gt_pose(poses)
-    logging.info(f"after viewpoint, add_errs min:{add_errs.min()}")
+    # (speedopt) lazy logging: an f-string formats GPU tensors (forces a sync) even when INFO is off
+    logging.info("after viewpoint, add_errs min:%s", add_errs)
 
     xyz_map = depth2xyzmap(depth, K)
       # process_end_time = time.time()
@@ -243,14 +244,14 @@ class FoundationPose:
       imageio.imwrite(f'{self.debug_dir}/vis_score.png', vis)
     # final_processing_start_time = time.time()
     add_errs = self.compute_add_err_to_gt_pose(poses)
-    logging.info(f"final, add_errs min:{add_errs.min()}")
+    logging.info("final, add_errs:%s", add_errs)
 
     ids = torch.as_tensor(scores).argsort(descending=True)
-    logging.info(f'sort ids:{ids}')
+    logging.info('sort ids:%s', ids)
     scores = scores[ids]
     poses = poses[ids]
 
-    logging.info(f'sorted scores:{scores}')
+    logging.info('sorted scores:%s', scores)
 
     best_pose = poses[0]@self.get_tf_to_centered_mesh()
     self.pose_last = poses[0]
@@ -288,7 +289,7 @@ class FoundationPose:
 
     xyz_map = depth2xyzmap_batch(depth[None], torch.as_tensor(K, dtype=torch.float, device='cuda')[None], zfar=np.inf)[0]
     # predict_start_time = time.time()
-    pose, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=self.pose_last.reshape(1,4,4).data.cpu().numpy(), normal_map=None, xyz_map=xyz_map, mesh_diameter=self.diameter, glctx=self.glctx, iteration=iteration, get_vis=self.debug>=2)
+    pose, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=self.pose_last.reshape(1,4,4).data, normal_map=None, xyz_map=xyz_map, mesh_diameter=self.diameter, glctx=self.glctx, iteration=iteration, get_vis=self.debug>=2)  # (speedopt) stay on the GPU
     # predict_end_time = time.time()
     # predict_fps = 1.0 / (predict_end_time - predict_start_time)
     # print(f"Predict FPS: {predict_fps}")

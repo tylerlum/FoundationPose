@@ -21,7 +21,7 @@ from realworld.mujoco_rollout.stir_mujoco_sim import IIWA14_XML, SHARPA_XML, TRA
 from realworld.mujoco_rollout.robot_visuals import apply_training_robot_visuals  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-ASSETS = Path(os.environ.get('FPSIM_MESH_DIR', '/juno/u/tylerlum/tracking_meshes_20261026/red_brush'))
+ASSETS = Path(os.environ.get('FPSIM_MESH_DIR', '/juno/u/tylerlum/tracking_meshes_20261026/red_brush'))  # red_brush.obj + material_0.png
 # Camera (env FPSIM_CAM): the calibrated poses compared on 19 Nov; K at 960x540.
 CAMS = {
     'zed2_172707': ('/juno/u/tylerlum/camera_2_calibration_27432424/record_visual_20261118_172707/T_RC.txt',

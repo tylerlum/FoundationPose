@@ -31,4 +31,10 @@ for d in sys.argv[1:]:
         h = hist(rgb, m)
         if ref is None: ref = h
         out.append((i / fps, bhat(h, ref)))
+    import os as _os
+    _js = _os.environ.get('REAL_JSON')
+    if _js:
+        _all = json.load(open(_js)) if _os.path.exists(_js) else {}
+        _all.setdefault('appearance', {})[d.rstrip('/').split('/')[-1][:15]] = [[round(o[0], 2), round(float(o[1]), 3)] for o in out]
+        json.dump(_all, open(_js, 'w'))
     print(d.rstrip('/').split('/')[-1][:15], ' '.join(f'{t:.1f}:{e:.2f}' for t, e in out))
