@@ -752,6 +752,20 @@ def _build_parser():
     parser.add_argument('--lost_cooldown_s', type=float, default=1.0)
     parser.add_argument('--lost_mask_max_ratio', type=float, default=3.0,
                         help='Re-register from SAM2 only if its mask is <= this x the registration mask (not the hand).')
+    # FoundationPose++-style aids (fpp_tracking.py, 18 Nov 2026); all need --sam2_tool, all default off.
+    parser.add_argument('--fpp_anchor_xy', action='store_true',
+                        help='Before track_one, move object 1\'s starting pose so its centre projects onto the centre '
+                             'of SAM2\'s mask (FoundationPose++). SAM2 then runs every frame.')
+    parser.add_argument('--fpp_max_shift_px', type=float, default=60.0,
+                        help='Skip the xy anchor on frames where it would move the start more than this (px).')
+    parser.add_argument('--fpp_mask_depth_px', type=int, default=-1,
+                        help='>= 0: track object 1 on depth blanked outside SAM2\'s mask dilated by this many px, so '
+                             'FoundationPose cannot slide onto the hand / arm / table. -1 = off.')
+    parser.add_argument('--fpp_filter', action='store_true',
+                        help='Start object 1\'s track_one from a constant-velocity prediction of its last poses.')
+    parser.add_argument('--fpp_min_mask_px', type=int, default=60,
+                        help='Use the aids only on frames whose SAM2 mask has at least this many pixels '
+                             '(and at most --lost_mask_max_ratio x the registration mask).')
     parser.add_argument('--reseed_topic', type=str, default='',
                         help='PoseStamped (robot frame) to restart FoundationPose from when lost, e.g. '
                              '/robot_frame/tool_pose_node (the node with --tool_hand_hold_s). Needs --calibration.')
@@ -1302,8 +1316,43 @@ def main():
                 _rospy_q.Subscriber(args.reseed_topic, _PS, _reseed_cb, queue_size=1)
                 print(f'[robust] restart FoundationPose from {args.reseed_topic} when lost', flush=True)
 
+        fpp_on = args.fpp_anchor_xy or args.fpp_mask_depth_px >= 0 or args.fpp_filter
+        if fpp_on and sam is None:
+            raise SystemExit('--fpp_anchor_xy / --fpp_mask_depth_px / --fpp_filter need --sam2_tool (SAM2 gives the mask)')
+        if fpp_on:
+            import fpp_tracking
+            print(f'[fpp] object 1: anchor_xy={args.fpp_anchor_xy} (max {args.fpp_max_shift_px:g} px), '
+                  f'mask_depth_px={args.fpp_mask_depth_px}, filter={args.fpp_filter}; SAM2 every frame', flush=True)
+        pose_filter = fpp_tracking.PoseFilter() if args.fpp_filter else None
+        fpp_mask = dict(m=None, ms=0.0)     # SAM2 mask made before track_one this frame; _robust_step reuses it
+
+        def _fpp_pre(o, rgb, depth):
+            """SAM2 on this frame, then (if its mask is usable) the FoundationPose++ aids on object 1's starting
+            pose and depth. Returns (depth for track_one, log fields)."""
+            _t0 = time.time()
+            m = sam.track(rgb)
+            fpp_mask['m'], fpp_mask['ms'] = m, (time.time() - _t0) * 1e3
+            n = int(m.sum())
+            row = dict(fpp_px=n, fpp_used=False, fpp_shift_px=float('nan'))
+            if not (args.fpp_min_mask_px <= n <= args.lost_mask_max_ratio * max(robust_state['mask0_px'], 1)):
+                return depth, row
+            row['fpp_used'] = True
+            if pose_filter is not None:
+                P = pose_filter.predict()
+                if P is not None:
+                    o.est.pose_last = torch.as_tensor(P, device=o.est.pose_last.device,
+                                                      dtype=o.est.pose_last.dtype).reshape(o.est.pose_last.shape)
+            if args.fpp_anchor_xy:
+                o.est.pose_last, row['fpp_shift_px'] = fpp_tracking.anchor_xy(
+                    o.est.pose_last, K, fpp_tracking.mask_centre(m), args.fpp_max_shift_px)
+            if args.fpp_mask_depth_px >= 0:
+                depth = fpp_tracking.masked_depth(depth, m, args.fpp_mask_depth_px)
+            return depth, row
+
         def _set_state(o, T):
             """Restart FoundationPose's track_one from pose T (mesh frame, camera)."""
+            if pose_filter is not None and o.k == 0:
+                pose_filter.reset()
             shape = o.est.pose_last.shape
             pl = robust_tool.pose_last_from_pose(T, o.est.model_center)
             o.est.pose_last = torch.as_tensor(pl, device=o.est.pose_last.device,
@@ -1366,7 +1415,10 @@ def main():
                         robust_state['n_tag_fix'] += 1
             c = dict(badness=0.0, lost=False, iou=float('nan'), dpx=float('nan'))
             if sam is not None:
-                if robust_state['frame'] % max(args.sam2_every, 1) == 0:
+                if fpp_mask['m'] is not None:          # already run before track_one (--fpp_*)
+                    mask, row['sam_ms'] = fpp_mask['m'], fpp_mask['ms']
+                    fpp_mask['m'] = None
+                elif robust_state['frame'] % max(args.sam2_every, 1) == 0:
                     _t0 = time.time()
                     mask = sam.track(rgb)
                     row['sam_ms'] = (time.time() - _t0) * 1e3
@@ -1388,6 +1440,8 @@ def main():
                         try:
                             o.pose = _register(o, rgb, depth, mask)
                             row['action'] = 'reregister_sam2'
+                            if pose_filter is not None:
+                                pose_filter.reset()
                         except RuntimeError as exc:
                             row['action'] = f'reregister_failed: {exc}'
                             if T is not None:
@@ -1547,6 +1601,8 @@ def main():
                     continue
                 print(f'[live_tracking]   object {k + 1} re-registered in '
                       f'{time.time()-_t_reg:.2f}s', flush=True)
+                if k == 0 and pose_filter is not None:
+                    pose_filter.reset()
                 if k == 0 and sam is not None:
                     sam.reset(rgb_r, mask_r)
                     robust_state['mask0_px'] = int(np.asarray(mask_r).astype(bool).sum())
@@ -1616,12 +1672,19 @@ def main():
                         if t0 - last_track_2 < 1.0 / args.track_hz_2:
                             continue        # keep (and publish again) its last pose
                         last_track_2 = t0
-                    o.pose = o.est.track_one(rgb=rgb, depth=depth, K=K,
+                    _depth_o, _fpp_row = depth, None
+                    if fpp_on and o.k == 0:
+                        _depth_o, _fpp_row = _fpp_pre(o, rgb, depth)
+                    o.pose = o.est.track_one(rgb=rgb, depth=_depth_o, K=K,
                                              iteration=args.track_refine_iter)
+                    if pose_filter is not None and o.k == 0:
+                        pose_filter.update(o.est.pose_last.reshape(-1, 4, 4)[0].detach().cpu().numpy())
                     if _forced(o):
                         o.pose = _snap_upright(o)
                     if o.k == 0 and (sam is not None or tag is not None):
                         _rrow = _robust_step(o, rgb, depth)
+                        if _fpp_row is not None:
+                            _rrow.update(_fpp_row)
                         if recording:
                             robust_log.append(_rrow)
                     t_track[o.k] = time.time() - t0
