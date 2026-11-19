@@ -878,6 +878,9 @@ def _build_parser():
                              'silhouette while the pose explains the depth (fit >= --fit_ok), SAM2 bled onto the '
                              'hand/arm: not lost, re-seed SAM2 from the pose\'s visible pixels. After a '
                              're-registration keep the new pose only if cover x fit beats the old one.')
+    parser.add_argument('--sam2_simple_prompt', action='store_true',
+                        help='Prompt SAM2 with box + 1 point (before 19 Nov). Default: box + 4 positive points + 6 '
+                             'negative points around the mask, which stops SAM2 taking the hand and arm.')
     parser.add_argument('--bleed_ratio', type=float, default=1.5)
     parser.add_argument('--color_good', type=float, default=0.15,
                         help='--arbitrate color: the pose is trusted when its rendered colours differ from the image by '
@@ -1518,6 +1521,7 @@ def main():
         reseed_msg = dict(T=None, t=0.0)
         if args.sam2_tool or args.end_tag_id >= 0:
             import robust_tool
+            robust_tool.RICH_PROMPT = not args.sam2_simple_prompt
         if args.sam2_tool:
             _t = time.time()
             sam = robust_tool.SamTool(ckpt=args.sam2_ckpt or robust_tool.SAM2_CKPT,

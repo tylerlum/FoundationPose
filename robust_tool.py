@@ -37,6 +37,38 @@ def mask_prompt(mask):
     return box, np.array([[px, py]], np.float32)
 
 
+def mask_prompt_rich(mask, n_pos=4, n_neg=6, ring=(12, 30)):
+    """(19 Nov 2026) Box + n_pos positive points spread over the mask's core + n_neg negative points on a ring
+    ring[0]..ring[1] px outside it. With only box + 1 point, SAM2 and SAM3 both segment the whole arm + hand + tool
+    when the tool is held (sim, mask IoU with the true visible tool 0.25-0.38); with these points 0.82-0.91."""
+    m = np.asarray(mask).astype(np.uint8)
+    box, pt = mask_prompt(m)
+    core = cv2.distanceTransform(m, cv2.DIST_L2, 5)
+    cand = np.argwhere(core > 0.5 * core.max())[:, ::-1].astype(np.float32)
+    pos = [pt[0]]
+    while len(pos) < n_pos and len(cand):
+        d = np.min(np.linalg.norm(cand[:, None] - np.array(pos)[None], axis=2), 1)
+        pos.append(cand[int(d.argmax())])
+    outer = cv2.dilate(m, np.ones((2 * ring[1] + 1,) * 2, np.uint8))
+    inner = cv2.dilate(m, np.ones((2 * ring[0] + 1,) * 2, np.uint8))
+    rc = np.argwhere((outer > 0) & (inner == 0))[:, ::-1].astype(np.float32)
+    if len(rc) > 4000:
+        rc = rc[np.random.RandomState(0).choice(len(rc), 4000, replace=False)]
+    neg = []
+    while len(neg) < n_neg and len(rc):
+        if not neg:
+            neg.append(rc[0])
+            continue
+        d = np.min(np.linalg.norm(rc[:, None] - np.array(neg)[None], axis=2), 1)
+        neg.append(rc[int(d.argmax())])
+    pts = np.array(pos + neg, np.float32)
+    lab = np.array([1] * len(pos) + [0] * len(neg), np.int32)
+    return box, pts, lab
+
+
+RICH_PROMPT = True   # set False to get the old box + 1 point prompt
+
+
 class SamTool:
     """SAM2's camera predictor for one object. reset(rgb, mask) starts it on a frame; track(rgb) -> bool mask."""
 
@@ -74,14 +106,17 @@ class SamTool:
         return t.inference_mode(), t.autocast('cuda', dtype=t.bfloat16), t.device('cpu')
 
     def reset(self, rgb, mask):
-        box, pt = mask_prompt(mask)
+        if RICH_PROMPT:
+            box, pt, lab = mask_prompt_rich(mask)
+        else:
+            box, pt = mask_prompt(mask)
+            lab = np.array([1], np.int32)
         a, b, c = self._ctx()
         with a, b, c:
             if self.started:
                 self.pred.reset_state()
             self.pred.load_first_frame(rgb)
-            self.pred.add_new_prompt(frame_idx=0, obj_id=1, bbox=box, points=pt,
-                                     labels=np.array([1], np.int32))
+            self.pred.add_new_prompt(frame_idx=0, obj_id=1, bbox=box, points=pt, labels=lab)
         self.started = True
         self.last = np.asarray(mask).astype(bool)
         return box, pt

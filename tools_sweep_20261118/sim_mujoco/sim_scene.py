@@ -21,9 +21,20 @@ from realworld.mujoco_rollout.stir_mujoco_sim import IIWA14_XML, SHARPA_XML, TRA
 from realworld.mujoco_rollout.robot_visuals import apply_training_robot_visuals  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-ASSETS = Path(os.environ.get('FPSIM_MESH_DIR', '/juno/u/tylerlum/tracking_meshes_20261026/red_brush'))  # red_brush.obj + material_0.png
-TRC = '/juno/u/tylerlum/camera_2_calibration_27432424/record_visual_20261118_172707/T_RC.txt'
-K960 = np.array([[528.866, 0, 486.258], [0, 528.866, 276.284], [0, 0, 1.0]])
+ASSETS = Path(os.environ.get('FPSIM_MESH_DIR', '/juno/u/tylerlum/tracking_meshes_20261026/red_brush'))
+# Camera (env FPSIM_CAM): the calibrated poses compared on 19 Nov; K at 960x540.
+CAMS = {
+    'zed2_172707': ('/juno/u/tylerlum/camera_2_calibration_27432424/record_visual_20261118_172707/T_RC.txt',
+                    (528.866, 528.866, 486.258, 276.284)),   # current, front-on
+    'zed2_161129': ('/juno/u/tylerlum/camera_2_calibration_27432424/record_visual_20261118_161129/T_RC.txt',
+                    (528.866, 528.866, 486.258, 276.284)),   # previous, diagonal from the robot's right
+    'zed1': ('/juno/u/tylerlum/camera_calibration/replay_20261016_161152/T_RC.txt',
+             (692.022, 692.022, 480.106, 282.767)),           # ZED1, left side
+}
+CAM = os.environ.get('FPSIM_CAM', 'zed2_172707')
+TRC = CAMS[CAM][0]
+_fx, _fy, _cx, _cy = CAMS[CAM][1]
+K960 = np.array([[_fx, 0, _cx], [0, _fy, _cy], [0, 0, 1.0]])
 W, H = 960, 540
 BASELINE = 0.12
 TABLE_TOP = 0.540

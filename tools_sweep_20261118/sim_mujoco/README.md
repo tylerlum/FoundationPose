@@ -27,3 +27,15 @@ Results, 8 takes, realtime replay (frames within 2 cm / frames > 5 cm off / reco
 plain 25% / 74% / 1 of 8; v4 30% / 67% / 2 of 8; v7-v8 (colour arbitration) 49-71% / 22-47% / 6-7 of 8.
 Identical configs vary a lot run to run (async SAM2 + timing): compare over several takes and repeats.
 Limits: kinematic grasp (no finger contact), MuJoCo shading, white hand, plain background; replay at 0.5x scale.
+
+## 19 Nov update
+- SAM prompt: box + 1 point made SAM2 AND SAM3 segment arm + hand + brush when the brush is held (sim mask IoU
+  0.25-0.38). `robust_tool.SamTool` now prompts box + 4 positive + 6 negative points (IoU 0.82-0.91, same 13 ms);
+  `--sam2_simple_prompt` restores the old one. SAM3 tracker with a mask prompt: IoU 0.88-0.95 but 80 ms/frame.
+  `sam_bench.py`, `sam_video.py` (side-by-side videos, sim + real).
+- WARNING, colour check (`--arbitrate color`): thresholds are from sim. On REAL takes (`real_color.py`) a correctly
+  tracked brush on the table scores 0.28-0.31 (sim 0.07) because the mesh texture is dark and its handle is red where
+  the real one is black, and the brush stuck on the orange KUKA link scores the same. Do not use the absolute
+  thresholds live until recalibrated / replaced (see the 19 Nov message).
+- `FPSIM_CAM` = zed2_172707 (current) | zed2_161129 (previous diagonal) | zed1 selects the camera; `batch_cam.sh`.
+- `timing.py`: register 0.57 s (iter 2) / 0.98 s (iter 5), track_one ~20-40 ms, colour check 2 ms (shared GPU).
