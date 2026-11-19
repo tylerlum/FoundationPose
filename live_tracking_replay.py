@@ -20,19 +20,9 @@ import numpy as np
 # read from the station repo (github.com/tylerlum/kuka_sharpa_station), which
 # keeps every calibration, dated, and the one in use as calibrations/current.txt:
 # a camera move is a commit there, not an edit here. KUKA_SHARPA_STATION points
-# at its clone; by default the clone sits next to this repo: next to this
-# FoundationPose checkout, or next to depthbasedRL when this folder is its
-# third_party/FoundationPose.
-def _default_station_dir():
-    here = Path(__file__).resolve().parent
-    candidates = [here.parent / 'kuka_sharpa_station', here.parents[2] / 'kuka_sharpa_station']
-    for c in candidates:
-        if c.is_dir():
-            return c
-    return candidates[0]
-
-
-STATION_DIR = Path(os.environ.get('KUKA_SHARPA_STATION', _default_station_dir()))
+# at its clone; by default the clone sits next to this repo.
+STATION_DIR = Path(os.environ.get(
+    'KUKA_SHARPA_STATION', Path(__file__).resolve().parents[3] / 'kuka_sharpa_station'))
 T_RC_FILE = STATION_DIR / 'calibrations' / 'current.txt'
 
 # Used only when T_RC_FILE is missing: the 13 Oct 2026 viser calibration

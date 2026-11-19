@@ -59,6 +59,27 @@ Example (bohg-ws-16):
 
 Two objects cost two track_one() calls per frame: expect roughly half the
 single-object loop rate.
+--track_hz_2 1 tracks object 2 once per second (a bowl or a screw that stays
+still) and publishes its last pose again between updates: ~11 ms less per frame.
+
+Capture stamps and the payload topics (17 Nov 2026, for the brush + cube sweep):
+
+- Every PoseStamped (camera_frame/ and robot_frame/) is stamped with the ZED
+  image capture time (sl.TIME_REFERENCE.IMAGE, host clock = ROS time) of the
+  frame that produced that object's pose, not the publish time. An object not
+  tracked on a frame (--track_hz_2) keeps the stamp of the frame it was.
+- --payload_object K (1 or 2; 0 = off) also publishes object K's robot-frame
+  pose on --payload_pose_topic (default /perception/payload/pose_robot): the
+  same message as robot_frame/<topic>, so T_RC is applied once. With it,
+  --payload_status_topic (default /perception/payload/status) carries a
+  std_msgs/String JSON {"valid": bool, "stamp": <header.stamp.to_sec() of that
+  pose>, "reason": ..., ...}. valid comes from payload_check.PayloadCheck on
+  that same frame (colour, silhouette IoU, depth surface, jump), whose
+  defaults are the sweep deployment's cube contract (--payload_config reads
+  another JSON's "cube" section). It is false for a lost, hidden, or rejected
+  observation and after a failed registration.
+- A take also writes frame_log.jsonl: per frame, each object's capture stamp
+  and the payload verdict.
 """
 
 import os
@@ -205,14 +226,20 @@ class RosPosePublisher2:
 
     object k publishes on camera_frame/<topics[k]> (header frame_id) and, when
     publish_robot_frame, on robot_frame/<topics[k]> (pose T_RC @ pose_cam).
+    Headers carry the capture stamp passed in (ts_ns, ROS time in ns).
+    payload_k (0-based, or None) also publishes that object's robot-frame
+    message on payload_pose_topic and its validity on payload_status_topic.
     The caller imports rospy BEFORE the FoundationPose stack (see above).
     """
 
-    def __init__(self, frame_id, publish_robot_frame, topics):
+    def __init__(self, frame_id, publish_robot_frame, topics, payload_k=None,
+                 payload_pose_topic=None, payload_status_topic=None):
         import rospy
         from geometry_msgs.msg import PoseStamped
+        from std_msgs.msg import String
         self._rospy = rospy
         self._PoseStamped = PoseStamped
+        self._String = String
         rospy.init_node('foundationpose_live_tracking_2_objects', anonymous=True)
         self.frame_id = frame_id
         self.cam_pubs = [rospy.Publisher(f'camera_frame/{t}', PoseStamped,
@@ -220,10 +247,24 @@ class RosPosePublisher2:
         self.robot_pubs = ([rospy.Publisher(f'robot_frame/{t}', PoseStamped,
                                             queue_size=1) for t in topics]
                            if publish_robot_frame else [None, None])
+        self.payload_k = payload_k
+        self.payload_pose_pub = self.payload_status_pub = None
+        if payload_k is not None:
+            self.payload_pose_pub = rospy.Publisher(payload_pose_topic, PoseStamped,
+                                                    queue_size=1)
+            self.payload_status_pub = rospy.Publisher(payload_status_topic, String,
+                                                      queue_size=1)
 
-    def _msg(self, T, frame_id):
+    def _stamp(self, ts_ns):
+        if ts_ns is None:
+            return self._rospy.Time.now()
+        ts_ns = int(ts_ns)
+        return self._rospy.Time(secs=ts_ns // 1_000_000_000,
+                                nsecs=ts_ns % 1_000_000_000)
+
+    def _msg(self, T, frame_id, stamp):
         msg = self._PoseStamped()
-        msg.header.stamp = self._rospy.Time.now()
+        msg.header.stamp = stamp
         msg.header.frame_id = frame_id
         msg.pose.position.x = float(T[0, 3])
         msg.pose.position.y = float(T[1, 3])
@@ -235,16 +276,34 @@ class RosPosePublisher2:
         msg.pose.orientation.w = float(quat_wxyz[0])
         return msg
 
-    def publish(self, k, pose_cam, T_RC=None):
-        if pose_cam is None:
+    def publish(self, k, pose_cam, T_RC=None, ts_ns=None, status=None):
+        """status: the payload verdict for this pose (dict with 'valid',
+        'reason', ...), used only for object payload_k."""
+        stamp = self._stamp(ts_ns)
+        robot_msg = None
+        if pose_cam is not None and np.isfinite(pose_cam).all():
+            self.cam_pubs[k].publish(self._msg(pose_cam, self.frame_id, stamp))
+            if self.robot_pubs[k] is not None and T_RC is not None:
+                robot_msg = self._msg(T_RC @ pose_cam, 'robot_frame', stamp)
+                self.robot_pubs[k].publish(robot_msg)
+        if k != self.payload_k:
             return
-        self.cam_pubs[k].publish(self._msg(pose_cam, self.frame_id))
-        if self.robot_pubs[k] is not None and T_RC is not None:
-            self.robot_pubs[k].publish(self._msg(T_RC @ pose_cam, 'robot_frame'))
+        if robot_msg is not None:
+            self.payload_pose_pub.publish(robot_msg)
+        status = dict(status or {})
+        body = {'valid': bool(status.get('valid', False)) and robot_msg is not None,
+                'stamp': stamp.to_sec(),
+                'reason': status.get('reason', '') if robot_msg is not None else 'no_pose',
+                'source': 'foundationpose_live_tracking_2_objects'}
+        for key in ('color_px', 'iou', 'depth_px', 'surface_frac', 'jump_m'):
+            if key in status:
+                v = status[key]
+                body[key] = v if (not isinstance(v, float) or math.isfinite(v)) else None
+        self.payload_status_pub.publish(self._String(data=_json.dumps(body)))
 
-    def publish_both(self, poses, T_RC=None):
-        for k in (0, 1):
-            self.publish(k, poses[k], T_RC)
+    def publish_objs(self, objs, T_RC=None):
+        for o in objs:
+            self.publish(o.k, o.pose, T_RC, ts_ns=o.ts_ns, status=o.status)
 
     def shutdown_requested(self):
         return self._rospy.is_shutdown()
@@ -257,7 +316,9 @@ class ReplayCapture:
     (float, m) with the same stems, and cam_K.txt (FoundationPose's demo
     layout). Frames are resized to the tracker's size (fp_size = (W, H)) and K
     is scaled to match. One frame per latest() call; `exhausted` after the
-    last. `frame_name` is the stem of the frame last served.
+    last. `frame_name` is the stem of the frame last served. An optional
+    ts_ns.txt ("<stem> <capture ns>" per line) replays the original capture
+    stamps; without it a frame is stamped when it is read.
     """
 
     def __init__(self, replay_dir, fp_size):
@@ -274,6 +335,12 @@ class ReplayCapture:
         self.exhausted = False
         self.frame_name = None
         self._i = 0
+        self.ts_ns = {}
+        if (self.dir / 'ts_ns.txt').is_file():
+            for line in (self.dir / 'ts_ns.txt').read_text().split('\n'):
+                if line.strip():
+                    stem, ns = line.split()
+                    self.ts_ns[stem] = int(ns)
 
     def start(self, ready_timeout=None):
         K = np.loadtxt(self.dir / 'cam_K.txt').reshape(3, 3)
@@ -301,7 +368,7 @@ class ReplayCapture:
             depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_NEAREST)
         self.frame_name = p.stem
         self._i += 1
-        return self._i, time.time_ns(), rgb, depth
+        return self._i, self.ts_ns.get(p.stem, time.time_ns()), rgb, depth
 
     def stop_capture(self):
         pass
@@ -546,6 +613,19 @@ def _build_parser():
                              '(.npy or .txt) overriding T_RC_DEFAULT.')
     parser.add_argument('--no_robot_frame', action='store_true',
                         help='With --ros, skip the robot_frame publishes.')
+    parser.add_argument('--payload_object', type=int, choices=[0, 1, 2], default=0,
+                        help='With --ros: also publish this object (1 or 2) as the '
+                             'payload: its robot-frame pose on --payload_pose_topic '
+                             'and a JSON validity status on --payload_status_topic. '
+                             '0 = off.')
+    parser.add_argument('--payload_pose_topic', type=str,
+                        default='/perception/payload/pose_robot')
+    parser.add_argument('--payload_status_topic', type=str,
+                        default='/perception/payload/status')
+    parser.add_argument('--payload_config', type=str, default=None,
+                        help='JSON whose "cube" section (or top level) overrides '
+                             'payload_check.SWEEP_CUBE_29MM, e.g. the sweep '
+                             "deployment's sweep_payload_29mm.json.")
     parser.add_argument('--serial_number', type=str, default='15107')
     parser.add_argument('--camera_upsidedown', action='store_true')
     parser.add_argument('--camera_resolution', choices=['HD1080', 'HD720', 'VGA'],
@@ -709,6 +789,11 @@ def _build_parser():
                              'where register put it (re-registering moves it), '
                              'so only the heading about +z is tracked. Implies '
                              '--force_upright.')
+    parser.add_argument('--track_hz_2', type=float, default=0.0,
+                        help='Track object 2 only this many times per second '
+                             '(e.g. 1 for a bowl or a screw that stays still); '
+                             'between updates its last pose is published '
+                             'again. 0 (default): track it every frame.')
     # ---- offline -------------------------------------------------------------
     parser.add_argument('--replay_dir', type=str, default=None,
                         help='Read RGB-D frames from this folder (rgb/, '
@@ -744,6 +829,9 @@ class _Obj:
         self.pose = None
         self.upright = False
         self.n_turned = 0          # registrations turned upright
+        self.ts_ns = None          # capture stamp of the frame behind self.pose
+        self.status = None         # payload verdict for self.pose (payload object only)
+        self.check = None          # PayloadCheck (payload object only)
 
     @property
     def name(self):
@@ -806,8 +894,26 @@ def main():
         T_up = T_RC_DEFAULT
     up_cam = np.asarray(T_up, dtype=np.float64)[:3, :3].T @ np.array([0.0, 0.0, 1.0])
 
+    payload_k = args.payload_object - 1 if args.payload_object else None
+    payload_cfg = None
+    if payload_k is not None:
+        if T_RC is None:
+            sys.exit('--payload_object needs --ros and the robot frame '
+                     '(not --no_robot_frame)')
+        from payload_check import SWEEP_CUBE_29MM
+        payload_cfg = dict(SWEEP_CUBE_29MM)
+        if args.payload_config:
+            with open(args.payload_config) as fh:
+                _pc = _json.load(fh)
+            _pc = _pc.get('cube', _pc)
+            payload_cfg.update({k: _pc[k] for k in SWEEP_CUBE_29MM if k in _pc})
+        print(f'[payload] object {args.payload_object} -> {args.payload_pose_topic} + '
+              f'{args.payload_status_topic}; check {payload_cfg}', flush=True)
+
     ros_pub = (RosPosePublisher2(args.frame_id, publish_robot_frame=(T_RC is not None),
-                                 topics=[o.topic for o in objs])
+                                 topics=[o.topic for o in objs], payload_k=payload_k,
+                                 payload_pose_topic=args.payload_pose_topic,
+                                 payload_status_topic=args.payload_status_topic)
                if args.ros else None)
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -818,6 +924,7 @@ def main():
                    for name in ('grab', 'depth', 'track_1', 'track_2',
                                 'publish', 'total')}
     viz_log = _deque(maxlen=buffer_frame_cap)
+    frame_log = _deque(maxlen=buffer_frame_cap)   # per frame: capture stamps + payload verdict
     if buffer_frame_cap is None:
         print('[buffer] frame buffer cap disabled')
     else:
@@ -847,8 +954,9 @@ def main():
         for v in stage_times.values():
             v.clear()
         viz_log.clear()
+        frame_log.clear()
 
-    def _write_take(reason, raw, poses, fts, sts, vizs, started):
+    def _write_take(reason, raw, poses, fts, sts, vizs, started, flog):
         """Encode and write one take from a snapshot of the buffers."""
         _t_enc = time.time()
         n = len(raw)
@@ -885,6 +993,7 @@ def main():
                 'target_fps': args.fps,
                 'track_refine_iter': args.track_refine_iter,
                 'est_refine_iter': args.est_refine_iter,
+                'track_hz_2': args.track_hz_2,
                 'n_frames': n,
                 'duration_s': recorded_s,
                 'stop_reason': reason,
@@ -895,8 +1004,20 @@ def main():
                 'ros_master_uri': os.environ.get('ROS_MASTER_URI'),
                 'saved_at': _dt.datetime.now().isoformat(timespec='seconds'),
             }
+            meta['stamps'] = 'ZED image capture time (sl.TIME_REFERENCE.IMAGE), ROS time'
+            meta['payload'] = (None if payload_k is None else {
+                'object': args.payload_object, 'pose_topic': args.payload_pose_topic,
+                'status_topic': args.payload_status_topic,
+                'config_file': (os.path.abspath(args.payload_config)
+                                if args.payload_config else None),
+                'check': payload_cfg,
+                'n_valid': int(sum(1 for r in flog if r.get('payload_valid'))),
+                'n_frames': len(flog)})
             with open(os.path.join(take_dir, 'metadata.json'), 'w') as fh:
                 _json.dump(meta, fh, indent=2)
+            with open(os.path.join(take_dir, 'frame_log.jsonl'), 'w') as fh:
+                for r in flog:
+                    fh.write(_json.dumps(r) + '\n')
             if vizs and K is not None and args.viz_data:
                 _save_viz_data_2(take_dir, vizs, poses, K, args.viz_stride,
                                  [o.mesh_path for o in objs],
@@ -908,7 +1029,7 @@ def main():
     def _snapshot():
         return (list(raw_frames), [list(pose_logs[0]), list(pose_logs[1])],
                 list(frame_times), {k: list(v) for k, v in stage_times.items()},
-                list(viz_log), _save_loop_start_time())
+                list(viz_log), _save_loop_start_time(), list(frame_log))
 
     def _save_take(reason, clear=True):
         """Save the take, blocking until it is on disk (as the one-object
@@ -1014,6 +1135,27 @@ def main():
             o.mesh, o.mesh_path = mesh, mesh_path
             o.upright = (not args.no_upright
                          and Path(mesh_path).stem in set(args.upright_meshes))
+            if o.k == payload_k:
+                from payload_check import PayloadCheck
+                from Utils import make_mesh_tensors
+                o.check = PayloadCheck(make_mesh_tensors(mesh), K, args.width,
+                                       args.height, glctx, **payload_cfg)
+                o.status = dict(valid=False, reason='not_registered')
+
+        def _observe(o, rgb, depth, ts_ns, registered=False):
+            """o.pose now comes from the frame captured at ts_ns: record the
+            stamp and, for the payload, judge that frame."""
+            o.ts_ns = ts_ns
+            if o.check is None:
+                return
+            if registered:
+                o.check.reset()
+            o.status = o.check.check(rgb, depth, o.pose, ts_ns * 1e-9)
+
+        def _reject(o, reason):
+            """The pose was not refreshed from a frame (failed registration)."""
+            if o.check is not None:
+                o.status = dict(valid=False, reason=reason)
 
         for o in objs:
             _set_mesh(o, o.mesh_path)
@@ -1154,7 +1296,7 @@ def main():
                       'it over (+z now up)', flush=True)
             return pose
 
-        rgb, depth, _, _, _ = fetch()
+        rgb, depth, ts0, _, _ = fetch()
         for o in objs:
             mask = _get_mask(o, rgb)
             if mask is None or mask.sum() == 0:
@@ -1163,9 +1305,10 @@ def main():
             print(f'Registering object {o.k + 1} ({o.name})...')
             t0 = time.time()
             o.pose = _register(o, rgb, depth, mask)
+            _observe(o, rgb, depth, ts0, registered=True)
             print(f'Object {o.k + 1} registered in {time.time()-t0:.3f}s')
         if ros_pub is not None:
-            ros_pub.publish_both([o.pose for o in objs], T_RC)
+            ros_pub.publish_objs(objs, T_RC)
 
         _lines = ['d: discard buffer',
                   'r: re-register both (drops buffer)',
@@ -1287,7 +1430,7 @@ def main():
                   f'{[k + 1 for k in which]} ({reason}); dropped {n_dropped} '
                   'buffered frames', flush=True)
             _t_rr = time.time()
-            rgb_r, depth_r, _, _, _ = fetch()
+            rgb_r, depth_r, ts_r, _, _ = fetch()
             for k in which:
                 o = objs[k]
                 _t_mask = time.time()
@@ -1297,6 +1440,7 @@ def main():
                 if mask_r is None or mask_r.sum() == 0:
                     print(f'[live_tracking]   object {k + 1}: no mask; keeping '
                           'its previous pose', flush=True)
+                    _reject(o, 'register_no_mask')
                     continue
                 _t_reg = time.time()
                 try:
@@ -1304,13 +1448,15 @@ def main():
                 except RuntimeError as exc:
                     print(f'[live_tracking]   {exc}; keeping its previous pose',
                           flush=True)
+                    _reject(o, 'register_failed')
                     continue
+                _observe(o, rgb_r, depth_r, ts_r, registered=True)
                 print(f'[live_tracking]   object {k + 1} re-registered in '
                       f'{time.time()-_t_reg:.2f}s', flush=True)
             print(f'[live_tracking]   total {time.time()-_t_rr:.2f}s', flush=True)
             _clear_buffers()
             if ros_pub is not None:
-                ros_pub.publish_both([o.pose for o in objs], T_RC)
+                ros_pub.publish_objs(objs, T_RC)
             _show_control_window()
             loop_start_time = time.time()
             return True
@@ -1350,12 +1496,16 @@ def main():
                 return False
             return True
 
+        last_track_2 = 0.0
+        if args.track_hz_2 > 0:
+            print(f'[track] object 2 tracked at {args.track_hz_2:g} Hz; its '
+                  f'last pose is published again between updates', flush=True)
         try:
             while keep_running():
                 loop_start = time.time()
 
                 try:
-                    rgb, depth, _ts, t_grab, t_depth = fetch()
+                    rgb, depth, ts_ns, t_grab, t_depth = fetch()
                 except _ReplayDone:
                     print('\n[replay] last frame reached', flush=True)
                     break
@@ -1363,16 +1513,21 @@ def main():
                 t_track = [0.0, 0.0]
                 for o in objs:
                     t0 = time.time()
+                    if o.k == 1 and args.track_hz_2 > 0:
+                        if t0 - last_track_2 < 1.0 / args.track_hz_2:
+                            continue        # keep (and publish again) its last pose
+                        last_track_2 = t0
                     o.pose = o.est.track_one(rgb=rgb, depth=depth, K=K,
                                              iteration=args.track_refine_iter)
                     if _forced(o):
                         o.pose = _snap_upright(o)
+                    _observe(o, rgb, depth, ts_ns)
                     t_track[o.k] = time.time() - t0
 
                 t_publish = 0.0
                 if ros_pub is not None:
                     t0 = time.time()
-                    ros_pub.publish_both([o.pose for o in objs], T_RC)
+                    ros_pub.publish_objs(objs, T_RC)
                     t_publish = time.time() - t0
 
                 if live_view is not None:
@@ -1385,6 +1540,18 @@ def main():
                     raw_frames.append(rgb)
                     for o in objs:
                         pose_logs[o.k].append(o.pose)
+                    _row = {'capture_ns': int(ts_ns),
+                            'object_capture_ns': [None if o.ts_ns is None else int(o.ts_ns)
+                                                  for o in objs]}
+                    if payload_k is not None:
+                        _st = objs[payload_k].status or {}
+                        _row['payload_valid'] = bool(_st.get('valid', False))
+                        _row['payload_reason'] = _st.get('reason', '')
+                        for _key in ('color_px', 'iou', 'depth_px', 'surface_frac', 'jump_m'):
+                            if _key in _st and not (isinstance(_st[_key], float)
+                                                    and not math.isfinite(_st[_key])):
+                                _row[_key] = _st[_key]
+                    frame_log.append(_row)
                     if _want_viz:
                         s = args.viz_stride
                         viz_log.append((rgb[::s, ::s].copy(),

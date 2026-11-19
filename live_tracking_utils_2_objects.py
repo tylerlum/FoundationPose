@@ -22,13 +22,12 @@ import numpy as np
 import trimesh
 
 
-# This file lives at the root of the FoundationPose checkout, so the package
-# directory is simply its own parent. (The upstream version of this script was
-# written for a vendored copy at <repo>/third_party/FoundationPose and resolved
-# the root via $DEPTHBASEDRL_ROOT; that indirection is not needed here.)
-_FP_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = Path(
+    os.environ.get("DEPTHBASEDRL_ROOT", "/juno/u/kedia/depthbasedRL")
+).resolve()
+_FP_DIR = _REPO_ROOT / "third_party" / "FoundationPose"
 
-for _path in (str(_FP_DIR),):
+for _path in (str(_FP_DIR), str(_REPO_ROOT)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 

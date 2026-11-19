@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "serial_number": "15107",
+  "capture_resolution": "HD1080",
+  "calibration_image_size": [
+    960,
+    540
+  ],
+  "calibration_K": [
+    [
+      692.0224609375,
+      0.0,
+      480.1062316894531
+    ],
+    [
+      0.0,
+      692.0224609375,
+      282.7669372558594
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "stream": "ZED rectified left",
+  "intrinsic_units": "pixels",
+  "image_rotation_degrees": 0,
+  "distortion": {
+    "model": "rectified pinhole",
+    "coefficients": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "note": "Zero distortion applies to rectified images; raw-lens coefficients were not logged."
+  },
+  "camera_frame": "optical: x right, y down, z forward",
+  "paired_extrinsics_file": "T_RC.txt",
+  "extrinsics_convention": "p_robot_base = T_RC @ p_camera_optical; translation in metres",
+  "intrinsics_by_resolution": {
+    "960x540": {
+      "width": 960,
+      "height": 540,
+      "K": [
+        [
+          692.0224609375,
+          0.0,
+          480.1062316894531
+        ],
+        [
+          0.0,
+          692.0224609375,
+          282.7669372558594
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "fx": 692.0224609375,
+      "fy": 692.0224609375,
+      "cx": 480.1062316894531,
+      "cy": 282.7669372558594,
+      "source": "recorded calibration K"
+    },
+    "160x90": {
+      "width": 160,
+      "height": 90,
+      "K": [
+        [
+          115.33707682291666,
+          0.0,
+          80.01770528157552
+        ],
+        [
+          0.0,
+          115.33707682291666,
+          47.12782287597656
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "fx": 115.33707682291666,
+      "fy": 115.33707682291666,
+      "cx": 80.01770528157552,
+      "cy": 47.12782287597656,
+      "source": "derived by full-frame pure scaling from recorded calibration K; not a separate lens calibration"
+    },
+    "1920x1080": {
+      "width": 1920,
+      "height": 1080,
+      "K": [
+        [
+          1384.044921875,
+          0.0,
+          960.2124633789062
+        ],
+        [
+          0.0,
+          1384.044921875,
+          565.5338745117188
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "fx": 1384.044921875,
+      "fy": 1384.044921875,
+      "cx": 960.2124633789062,
+      "cy": 565.5338745117188,
+      "source": "derived by full-frame pure scaling from recorded calibration K; not a separate lens calibration"
+    }
+  },
+  "resizing_note": "K at other sizes uses the capture pipeline scaling convention. Full frame, no crop.",
+  "provenance": {
+    "K_source": "/juno/u/tylerlum/camera_calibration/replay_20261016_161152/samples.npz [K]",
+    "image_dimensions_source": "/juno/u/tylerlum/camera_calibration/replay_20261016_161152/sample_01_raw.png",
+    "serial_number_source": "known recording-session camera identity; serial was not stored in legacy samples.npz",
+    "capture_settings_source": "session HD1080 setup and recorder defaults; capture mode/rotation omitted from legacy NPZ",
+    "paired_T_RC_sha256": "4f42e46be9076666589b2c7c00576f1970444cccd9eb522a4e9c156ffe779424"
+  }
+}

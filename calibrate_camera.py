@@ -54,10 +54,7 @@ from scipy.spatial.transform import Rotation
 
 _FP_DIR = Path(__file__).resolve().parent
 _REPO = _FP_DIR.parents[1]
-# The robot URDF. Default: depthbasedRL's copy (this folder is its third_party/FoundationPose). Outside depthbasedRL
-# set ROBOT_URDF (e.g. the SimToolReal repo's assets/urdf/kuka_sharpa_description/...) or pass --urdf.
-URDF = Path(os.environ.get(
-    'ROBOT_URDF', _REPO / 'assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf'))
+URDF = _REPO / 'assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf'
 ARM_JOINTS = [f'iiwa14_joint_{i}' for i in range(1, 8)]
 # simtoolreal's default arm pose (isaacgymenvs/tasks/simtoolreal/env.py; Kushal's viser_compare_pointclouds.py)
 DEFAULT_ARM_Q = [-1.571, 1.571, 0.0, 1.376, 0.0, 1.485, 1.308]

@@ -1,24 +1,17 @@
-# PyTorch
-# (bohg-ws-16, the robot's perception PC, runs these trackers on torch 2.7 + cu126 in a venv that also has
-#  Isaac Sim, with unpinned scipy / scikit-*, and no torch pin; see docs/bohg-ws-16/LIVE_TRACKING_RUNBOOK.md.
-#  The pins below are the standalone FoundationPose install.)
---extra-index-url https://download.pytorch.org/whl/cu118
-torch==2.0.0+cu118
-torchvision==0.15.1+cu118
-torchaudio==2.0.1+cu118
+# PyTorch (provided by the host venv — see docs/venv_isaacsim_install.md).
+# Upstream FoundationPose pins torch==2.0.0+cu118; we run on torch 2.7+cu126
+# alongside Isaac Sim. Do not pin torch in this file.
 
 # Common Libraries
-scipy==1.12.0
-scikit-learn==1.4.1.post1
-scikit-image==0.22.0
-pillow==10.2.0
+scipy
+scikit-learn
+scikit-image
 pyyaml==6.0.1
 ruamel.yaml==0.18.6
 ninja==1.11.1.1
 h5py==3.10.0
 numba==0.59.1
 pybind11==2.12.0
-tyro==0.8.3
 
 # CV Libraries
 imageio==2.34.0
@@ -36,7 +29,6 @@ rtree==1.2.0
 pyrender==0.1.45
 pyOpenGL>=3.1.0
 pyOpenGL_accelerate>=3.1.0
-viser==0.2.7
 
 # ML / FoundationPose
 timm==0.9.16
@@ -49,7 +41,8 @@ roma==1.4.4
 transformations==2024.6.1
 warp-lang==1.0.2
 
-# SAM (for mask generation)
+# SAM (for mask generation). Whatever transformers version is in the venv
+# (provided by Isaac Sim) is fine under torch 2.7+cu126.
 transformers
 
 # Misc
