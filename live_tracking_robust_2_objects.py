@@ -337,7 +337,12 @@ class ReplayCapture:
     stamps; without it a frame is stamped when it is read.
     """
 
-    def __init__(self, replay_dir, fp_size):
+    def __init__(self, replay_dir, fp_size, realtime_scale=0.0, fps=30.0):
+        # realtime_scale > 0 (19 Nov): skip frames like a live camera would. A virtual clock advances by the wall
+        # time between latest() calls x realtime_scale (< 1 when this machine runs the replay slower than live, e.g.
+        # 0.5 with a live tracker sharing the GPU); the served frame is the one the camera would have delivered.
+        self.realtime_scale, self.fps, self._vclock, self._tlast = float(realtime_scale), float(fps), 0.0, None
+        self.n_skipped = 0
         self.dir = Path(replay_dir)
         self.rgb_files = sorted((self.dir / 'rgb').glob('*.png'))
         if not self.rgb_files:
@@ -371,6 +376,18 @@ class ReplayCapture:
         if self._i >= len(self.rgb_files):
             self.exhausted = True
             return None
+        if self.realtime_scale > 0:
+            now = time.time()
+            if self._tlast is not None:
+                self._vclock += (now - self._tlast) * self.realtime_scale
+            self._tlast = now
+            want = int(self._vclock * self.fps)
+            if want > self._i:
+                self.n_skipped += min(want, len(self.rgb_files)) - self._i
+                self._i = want
+            if self._i >= len(self.rgb_files):
+                self.exhausted = True
+                return None
         p = self.rgb_files[self._i]
         rgb = cv2.cvtColor(cv2.imread(str(p)), cv2.COLOR_BGR2RGB)
         dp = self.depth_files[p.stem]
@@ -811,6 +828,9 @@ def _build_parser():
                              'between updates its last pose is published '
                              'again. 0 (default): track it every frame.')
     # ---- offline -------------------------------------------------------------
+    parser.add_argument('--replay_realtime_scale', type=float, default=0.0,
+                        help='With --replay_dir: > 0 skips frames like a live 30 fps camera, with processing time '
+                             'scaled by this (0.5 = this replay runs 2x slower than live). 0 = every frame.')
     parser.add_argument('--replay_dir', type=str, default=None,
                         help='Read RGB-D frames from this folder (rgb/, '
                              'depth/, cam_K.txt) instead of the ZED. The run '
@@ -852,6 +872,43 @@ def _build_parser():
                         help='Fixes that keep failing double the cooldown up to this (re-registration blocks ~0.6 s).')
     parser.add_argument('--lost_mask_max_ratio', type=float, default=3.0,
                         help='Re-register from SAM2 only if its mask is <= this x the registration mask (not the hand).')
+    parser.add_argument('--arbitrate', nargs='?', const='depth', default='off', choices=['off', 'depth', 'color'],
+                        help='(19 Nov) Before trusting a SAM2-vs-FoundationPose disagreement, check FoundationPose '
+                             'against the observed depth. If SAM2\'s mask grew past --bleed_ratio x the whole '
+                             'silhouette while the pose explains the depth (fit >= --fit_ok), SAM2 bled onto the '
+                             'hand/arm: not lost, re-seed SAM2 from the pose\'s visible pixels. After a '
+                             're-registration keep the new pose only if cover x fit beats the old one.')
+    parser.add_argument('--bleed_ratio', type=float, default=1.5)
+    parser.add_argument('--color_good', type=float, default=0.15,
+                        help='--arbitrate color: the pose is trusted when its rendered colours differ from the image by '
+                             'less than this (mean |rgb|, 0-1) on >= --color_min_px visible pixels.')
+    parser.add_argument('--color_bad', type=float, default=0.22)
+    parser.add_argument('--color_bad_checks', type=int, default=3,
+                        help='--arbitrate color: lost after this many checks in a row with colour error > --color_bad, '
+                             'even if SAM2 agrees (catches poses on the hand and upside-down tools).')
+    parser.add_argument('--color_every', type=int, default=2)
+    parser.add_argument('--color_mid_checks', type=int, default=10,
+                        help='--arbitrate color: after this many checks in a row between --color_good and '
+                             '--color_bad, try a (verified) re-registration.')
+    parser.add_argument('--color_min_px', type=int, default=400)
+    parser.add_argument('--flip_check_every', type=int, default=0,
+                        help='(19 Nov) Every N object-1 frames, refine the pose and its 180-degree twins about '
+                             '--flip_axes (mesh frame) and keep the one FoundationPose\'s scorer ranks best (margin '
+                             '--flip_margin). Fixes the tool tracked upside down after occlusion, which no 2D mask '
+                             'check sees. 0 = off.')
+    parser.add_argument('--flip_axes', type=str, default='x', help='Subset of xyz, e.g. x or xz.')
+    parser.add_argument('--flip_refine_iter', type=int, default=1)
+    parser.add_argument('--flip_margin', type=float, default=0.0, help='scorer judge: score margin to switch.')
+    parser.add_argument('--flip_judge', choices=['color', 'scorer'], default='color',
+                        help='color: render the textured mesh at each candidate and compare with the image on its '
+                             'visible, unoccluded pixels (the scorer\'s margins between twins were bf16 noise in '
+                             'sim); switch if the twin\'s colour error < --flip_ratio x the current one.')
+    parser.add_argument('--flip_ratio', type=float, default=0.8)
+    parser.add_argument('--flip_min_px', type=int, default=400)
+    parser.add_argument('--fit_tol', type=float, default=0.015, help='Depth match tolerance (m) for --arbitrate.')
+    parser.add_argument('--fit_ok', type=float, default=0.6)
+    parser.add_argument('--verify_margin', type=float, default=0.05)
+    parser.add_argument('--sam_reseed_min_s', type=float, default=0.5)
     # FoundationPose++-style aids (fpp_tracking.py, 18 Nov 2026); all need --sam2_tool, all default off.
     parser.add_argument('--save_depth', action='store_true',
                         help='Also write <take>/replay/ (rgb/*.png, depth/*.png uint16 mm, ts_ns.txt, cam_K.txt, '
@@ -1189,7 +1246,8 @@ def main():
     try:
         t_spawn = time.time()
         if replay:
-            capture = ReplayCapture(args.replay_dir, (args.width, args.height))
+            capture = ReplayCapture(args.replay_dir, (args.width, args.height),
+                                    realtime_scale=args.replay_realtime_scale)
             capture.start()
             K = capture.K
             print(f'[capture] replaying {len(capture.rgb_files)} frames from '
@@ -1597,6 +1655,86 @@ def main():
                                               dtype=o.est.pose_last.dtype).reshape(shape)
             o.pose = T
 
+        _flip_mats = None
+
+        def _flip_check(o, rgb, depth):
+            """Refine pose_last and its 180-degree twins (one track iteration each), score all with FoundationPose's
+            scorer, switch to a twin if it wins by --flip_margin. Returns (switched axis or '', scores)."""
+            nonlocal _flip_mats
+            from Utils import erode_depth, bilateral_filter_depth, depth2xyzmap_batch
+            from scipy.spatial.transform import Rotation as _Rf
+            est = o.est
+            P = est.pose_last.reshape(-1, 4, 4)[0]
+            if _flip_mats is None:
+                _flip_mats = []
+                for ax in args.flip_axes:
+                    F = torch.eye(4, device=P.device, dtype=P.dtype)
+                    F[:3, :3] = torch.as_tensor(_Rf.from_euler(ax, 180, degrees=True).as_matrix(), device=P.device,
+                                                dtype=P.dtype)
+                    _flip_mats.append(F)
+            # Twins about the axes through the mesh centre (pose_last is the centred mesh's pose).
+            cand = torch.stack([P] + [P @ F for F in _flip_mats])
+            d = torch.as_tensor(depth, device='cuda', dtype=torch.float)
+            d = bilateral_filter_depth(erode_depth(d, radius=2, device='cuda'), radius=2, device='cuda')
+            Kt = torch.as_tensor(K, dtype=torch.float, device='cuda')
+            xyz = depth2xyzmap_batch(d[None], Kt[None], zfar=np.inf)[0]
+            ref, _ = est.refiner.predict(mesh=est.mesh, mesh_tensors=est.mesh_tensors, rgb=rgb, depth=d, K=K,
+                                         ob_in_cams=cand.data.cpu().numpy(), normal_map=None, xyz_map=xyz,
+                                         mesh_diameter=est.diameter, glctx=est.glctx,
+                                         iteration=args.flip_refine_iter, get_vis=False)
+            if args.flip_judge == 'scorer':
+                sc, _ = est.scorer.predict(mesh=est.mesh, rgb=rgb, depth=d, K=K, ob_in_cams=ref.data.cpu().numpy(),
+                                           normal_map=None, mesh_tensors=est.mesh_tensors, glctx=est.glctx,
+                                           mesh_diameter=est.diameter, get_vis=False)
+                sc = torch.as_tensor(sc).float().reshape(-1).cpu().numpy()
+                b = int(np.argmax(sc))
+                if b == 0 or sc[b] - sc[0] <= args.flip_margin:
+                    return '', sc
+            else:
+                from Utils import nvdiffrast_render
+                col, dep, _ = nvdiffrast_render(K=K, H=d.shape[0], W=d.shape[1], ob_in_cams=ref.float(),
+                                                glctx=est.glctx, mesh_tensors=est.mesh_tensors)
+                obs = torch.as_tensor(rgb, device='cuda', dtype=torch.float) / 255.0
+                errs, npx = [], []
+                for i in range(len(ref)):
+                    vis_i = (dep[i] > 0) & (d > 0.05) & (d >= dep[i] - args.fit_tol)   # drawn, not covered by the hand
+                    n = int(vis_i.sum())
+                    npx.append(n)
+                    errs.append(float((col[i][vis_i].clamp(0, 1) - obs[vis_i]).abs().mean()) if n else float('inf'))
+                sc = np.array(errs)
+                b = int(np.argmin(sc))
+                if b == 0 or npx[b] < args.flip_min_px or npx[0] < args.flip_min_px or sc[b] >= args.flip_ratio * sc[0]:
+                    return '', sc
+            est.pose_last = ref[b].reshape(est.pose_last.shape).to(est.pose_last.dtype)
+            o.pose = (ref[b] @ est.get_tf_to_centered_mesh()).data.cpu().numpy().reshape(4, 4)
+            return args.flip_axes[b - 1], sc
+
+        def _fp_visible_mask(match):
+            """Largest blob of FoundationPose's depth-matching pixels (closed), to re-seed SAM2."""
+            m = cv2.morphologyEx(match.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+            n, lab, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+            if n <= 1:
+                return None
+            k = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            return lab == k if stats[k, cv2.CC_STAT_AREA] >= 200 else None
+
+        def _arb_score(mask, T, depth, rgb=None):
+            """Re-registration check. depth mode: cover (SAM2 mask inside the silhouette) x depth fit. colour mode:
+            1 - colour error (0 when hidden)."""
+            if T is None or not np.isfinite(T).all():
+                return 0.0
+            if args.arbitrate == 'color':
+                ce, n, _ = check.color_err(rgb, depth, T, args.fit_tol)
+                if np.isfinite(ce) and n >= args.color_min_px:
+                    return 1.0 - ce
+                # Too little of it visible to judge colour: fall back to the depth-mode score, scaled into
+                # [0, 0.5) so any pose with a colour verdict ranks above it.
+            sil = check.silhouette(T)
+            cover = (mask & sil).sum() / max(int(mask.sum()), 1)
+            fit, _, nrest = check.depth_fit(depth, T, args.fit_tol)
+            sc = float(cover) * (float(fit) if np.isfinite(fit) else 0.0)
+            return 0.5 * sc if args.arbitrate == 'color' else sc
+
         def _robust_step(o, rgb, depth):
             """The end-face tag (roll / end position fix), SAM2's mask, the check, and the fix when lost (object 1
             only). Returns this frame's log row."""
@@ -1666,6 +1804,56 @@ def main():
                 robust_state['last_iou'] = c['iou']
                 row.update({k: c[k] for k in ('iou', 'dpx', 'badness', 'bad', 'lost', 'sam_px', 'fp_px', 'usable')})
                 row['cover'] = c.get('cover', float('nan'))
+                if args.arbitrate == 'color' and o.pose is not None and (
+                        robust_state['frame'] % max(args.color_every, 1) == 0 or c['bad']):
+                    ce, ce_n, ce_good = check.color_err(rgb, depth, o.pose, args.fit_tol)
+                    row['ce'], row['ce_px'] = ce, ce_n
+                    seen = np.isfinite(ce) and ce_n >= args.color_min_px
+                    fp_good = seen and ce < args.color_good
+                    robust_state['n_cbad'] = robust_state.get('n_cbad', 0) + 1 if (seen and ce > args.color_bad) else 0
+                    robust_state['n_cmid'] = (robust_state.get('n_cmid', 0) + 1
+                                              if (seen and args.color_good <= ce <= args.color_bad) else 0)
+                    disagree = c.get('usable') and (c['bad'] or c['sam_px'] > args.bleed_ratio * max(c['fp_px'], 1))
+                    if fp_good and disagree:
+                        # SAM2 disagrees, but the pose's rendered colours match the image: trust the pose and
+                        # re-seed SAM2 from the pose's matching pixels.
+                        check.n_bad = 0
+                        c['bad'] = c['lost'] = False
+                        row['bad'] = row['lost'] = False
+                        if now - robust_state.get('last_sam_reseed', 0.0) > args.sam_reseed_min_s:
+                            vm = _fp_visible_mask(ce_good)
+                            if vm is not None:
+                                sam.reset(rgb, vm)
+                                robust_state['last_sam_reseed'] = now
+                                row['action'] = 'sam2_reseed_from_fp (colour ok)'
+                    elif robust_state['n_cbad'] >= args.color_bad_checks and c.get('usable'):
+                        c['lost'] = True
+                        row['lost'] = True
+                        row['why'] = 'colour'
+                    elif robust_state['n_cmid'] >= args.color_mid_checks and c.get('usable'):
+                        # Neither clearly right nor clearly wrong for a while: try a re-registration; the colour
+                        # check below keeps it only if it is better.
+                        robust_state['n_cmid'] = 0
+                        c['lost'] = True
+                        row['lost'] = True
+                        row['why'] = 'colour uncertain'
+                if args.arbitrate == 'depth' and c.get('usable') and (c['bad'] or c['sam_px'] > args.bleed_ratio * max(c['fp_px'], 1)):
+                    fit, match, _ = check.depth_fit(depth, o.pose, args.fit_tol)
+                    row['fit'] = fit
+                    if (np.isfinite(fit) and fit >= args.fit_ok
+                            and c['sam_px'] > args.bleed_ratio * max(c['fp_px'], 1)):
+                        # SAM2's mask is larger than the whole tool at FoundationPose's pose, and that pose explains
+                        # the depth: SAM2 bled onto the hand / arm. Not lost; re-seed SAM2 from the pose.
+                        check.n_bad = 0
+                        c['bad'] = c['lost'] = False
+                        row['bad'] = row['lost'] = False
+                        if now - robust_state.get('last_sam_reseed', 0.0) > args.sam_reseed_min_s:
+                            vm = _fp_visible_mask(match)
+                            if vm is not None:
+                                sam.reset(rgb, vm)
+                                robust_state['last_sam_reseed'] = now
+                                robust_state['n_sam_reseed'] = robust_state.get('n_sam_reseed', 0) + 1
+                                row['action'] = 'sam2_reseed_from_fp (bleed)'
                 if c['lost']:
                     robust_state['n_lost'] += 1
                 if (c['lost'] and args.lost_action == 'reregister'
@@ -1679,10 +1867,34 @@ def main():
                         row['action'] = 'anchor_sam2'
                     elif sam_ok:
                         try:
-                            o.pose = _register(o, rgb, depth, mask)
-                            row['action'] = 'reregister_sam2'
-                            if pose_filter is not None:
-                                pose_filter.reset()
+                            old_pose, old_pl = o.pose, o.est.pose_last.clone()
+                            s_old = _arb_score(mask, old_pose, depth, rgb) if args.arbitrate != 'off' else 0.0
+                            newT = _register(o, rgb, depth, mask)
+                            s_new = _arb_score(mask, newT, depth, rgb) if args.arbitrate != 'off' else 1.0
+                            # colour mode: an old pose that is clearly wrong (colour error > --color_bad, i.e.
+                            # score < 1 - color_bad) or unjudgeable needs no margin, only "no worse".
+                            old_bad = args.arbitrate == 'color' and s_old < 1.0 - args.color_bad
+                            if s_new >= s_old + (0.0 if old_bad else args.verify_margin) or (
+                                    args.arbitrate == 'color' and s_new >= 1.0 - args.color_good):
+                                o.pose = newT
+                                row['action'] = 'reregister_sam2'
+                                if pose_filter is not None:
+                                    pose_filter.reset()
+                            else:
+                                # The re-registration explains SAM2's mask + the depth no better: keep tracking.
+                                o.est.pose_last, o.pose = old_pl, old_pose
+                                row['action'] = f'reregister_rejected ({s_new:.2f} vs {s_old:.2f})'
+                                if args.arbitrate == 'color':
+                                    ce, ce_n, ce_good = check.color_err(rgb, depth, old_pose, args.fit_tol)
+                                    ok_old = np.isfinite(ce) and ce_n >= args.color_min_px and ce < args.color_good
+                                    vm = _fp_visible_mask(ce_good) if ok_old else None
+                                else:
+                                    fit, match, _ = check.depth_fit(depth, old_pose, args.fit_tol)
+                                    vm = _fp_visible_mask(match) if np.isfinite(fit) and fit >= args.fit_ok else None
+                                if vm is not None:
+                                    sam.reset(rgb, vm)
+                                    robust_state['last_sam_reseed'] = now
+                                    row['action'] += '; sam2_reseed_from_fp'
                         except RuntimeError as exc:
                             row['action'] = f'reregister_failed: {exc}'
                             if T is not None:
@@ -1700,6 +1912,7 @@ def main():
                     robust_state['last_fix'] = now
                     robust_state['n_fix'] += 1
                     check.n_bad = 0
+                    robust_state['n_cbad'] = 0
                     print(f'\n[sam2] object 1 LOST (iou {c["iou"]:.2f}, centres {c["dpx"]:.0f} px): {row["action"]} '
                           f'({time.time() - now:.2f}s)', flush=True)
             if quality_pub is not None:
@@ -1932,9 +2145,21 @@ def main():
                         pose_filter.update(o.est.pose_last.reshape(-1, 4, 4)[0].detach().cpu().numpy())
                     if _forced(o):
                         o.pose = _snap_upright(o)
+                    _flip_row = None
+                    if o.k == 0 and args.flip_check_every > 0:
+                        robust_state['flip_n'] = robust_state.get('flip_n', 0) + 1
+                        if robust_state['flip_n'] % args.flip_check_every == 0:
+                            _ax, _sc = _flip_check(o, rgb, depth)
+                            _flip_row = dict(flip=_ax, flip_scores=[round(float(x), 3) for x in _sc])
+                            if _ax:
+                                robust_state['n_flip'] = robust_state.get('n_flip', 0) + 1
+                                print(f'\n[flip] object 1 turned 180 deg about mesh {_ax} (scores {np.round(_sc, 2)})',
+                                      flush=True)
                     _observe(o, rgb, depth, ts_ns)
                     if o.k == 0 and (sam is not None or tag is not None):
                         _rrow = _robust_step(o, rgb, depth)
+                        if _flip_row:
+                            _rrow.update(_flip_row)
                         if _fpp_row is not None:
                             _rrow.update(_fpp_row)
                         if recording:

@@ -199,6 +199,57 @@ class ToolCheck:
             return (dep[0] > 0).cpu().numpy()
         return self.silhouette_cpu(T)
 
+    def render_depth(self, T):
+        """FoundationPose's rendered depth at pose T (H, W) float32 m, 0 = background (needs glctx)."""
+        if self.glctx is None or T is None or not np.isfinite(T).all() or T[2, 3] <= 0.01:
+            return np.zeros((self.H, self.W), np.float32)
+        import torch
+        from Utils import nvdiffrast_render
+        Tt = torch.as_tensor(np.asarray(T, np.float32)[None], device='cuda')
+        _, dep, _ = nvdiffrast_render(K=self.K, H=self.H, W=self.W, ob_in_cams=Tt, glctx=self.glctx,
+                                      mesh_tensors=self._mt)
+        return dep[0].cpu().numpy().astype(np.float32)
+
+    def depth_fit(self, depth, T, tol=0.015):
+        """How well pose T explains the observed depth (19 Nov 2026, arbitration between SAM2 and
+        FoundationPose). On the silhouette, with valid observed depth: 'front' pixels (observed nearer than the render
+        by > tol) are occluders (the hand) and are ignored; of the rest, fit = fraction within tol of the render.
+        A pose floating in free space or sunk into the table has many 'behind' pixels and a low fit. Also returns
+        the mask of matching pixels (FoundationPose's visible part), used to re-seed SAM2."""
+        ren = self.render_depth(T)
+        sil = ren > 0
+        ok = sil & (depth > 0.05)
+        if ok.sum() < self.min_mask_px:
+            return float('nan'), np.zeros_like(sil), 0
+        d = depth - ren
+        front = ok & (d < -tol)
+        match = ok & (np.abs(d) <= tol)
+        rest = int((ok & ~front).sum())
+        if rest < self.min_mask_px:
+            return float('nan'), match, rest
+        return float(match.sum()) / rest, match, rest
+
+    def color_err(self, rgb, depth, T, tol=0.015):
+        """Rendered textured mesh at pose T vs the image on its visible, unoccluded pixels (19 Nov 2026). Returns
+        (mean |rgb diff| in [0,1], n pixels, mask of pixels whose own diff < 0.25). Sim: right poses ~0.07 (p90 0.14),
+        poses > 5 cm off 0.23-0.41. NaN when < 200 pixels are visible (hidden: no verdict)."""
+        if self.glctx is None or T is None or not np.isfinite(T).all() or T[2, 3] <= 0.01:
+            return float('nan'), 0, None
+        import torch
+        from Utils import nvdiffrast_render
+        Tt = torch.as_tensor(np.asarray(T, np.float32)[None], device='cuda')
+        col, dep, _ = nvdiffrast_render(K=self.K, H=self.H, W=self.W, ob_in_cams=Tt, glctx=self.glctx,
+                                        mesh_tensors=self._mt)
+        d = torch.as_tensor(depth, device='cuda', dtype=torch.float32)
+        vis = (dep[0] > 0) & (d > 0.05) & (d >= dep[0] - tol)
+        n = int(vis.sum())
+        if n < 200:
+            return float('nan'), n, None
+        obs = torch.as_tensor(rgb, device='cuda', dtype=torch.float32) / 255.0
+        diff = (col[0].clamp(0, 1) - obs).abs().mean(-1)
+        good = vis & (diff < 0.25)
+        return float(diff[vis].mean()), n, good.cpu().numpy()
+
     def silhouette_cpu(self, T):
         m = np.zeros((self.H, self.W), np.uint8)
         if T is None or not np.isfinite(T).all():
