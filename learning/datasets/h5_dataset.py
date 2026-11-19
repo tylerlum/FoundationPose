@@ -95,7 +95,9 @@ class PairH5Dataset(torch.utils.data.Dataset):
     H,W = batch.rgbAs.shape[-2:]
     mesh_radius = batch.mesh_diameters.cuda()/2
     tf_to_crops = batch.tf_to_crops.cuda()
-    crop_to_oris = batch.tf_to_crops.inverse().cuda()  #(B,3,3)
+    # (speedopt) the inverse is only needed to build an xyz map from depth; .inverse() syncs
+    crop_to_oris = (torch.linalg.inv_ex(batch.tf_to_crops)[0].cuda()
+                    if (batch.xyz_mapAs is None or batch.xyz_mapBs is None) else None)  #(B,3,3)
     batch.poseA = batch.poseA.cuda()
     batch.Ks = batch.Ks.cuda()
 
@@ -108,7 +110,7 @@ class PairH5Dataset(torch.utils.data.Dataset):
     if self.cfg['normalize_xyz']:
       batch.xyz_mapAs *= 1/mesh_radius.reshape(bs,1,1,1)
       invalid = invalid.expand(bs,3,-1,-1) | (torch.abs(batch.xyz_mapAs)>=2)
-      batch.xyz_mapAs[invalid.expand(bs,3,-1,-1)] = 0
+      batch.xyz_mapAs.masked_fill_(invalid.expand(bs,3,-1,-1), 0)  # (speedopt) no sync
 
     if batch.xyz_mapBs is None:
       batch.xyz_mapBs = _crop_depth_to_xyzmap(batch.depthBs.cuda().expand(bs,-1,-1,-1), batch.Ks, crop_to_oris, tf_to_crops, H_ori, W_ori, H, W)  #(B,3,H,W)
@@ -119,7 +121,7 @@ class PairH5Dataset(torch.utils.data.Dataset):
     if self.cfg['normalize_xyz']:
       batch.xyz_mapBs *= 1/mesh_radius.reshape(bs,1,1,1)
       invalid = invalid.expand(bs,3,-1,-1) | (torch.abs(batch.xyz_mapBs)>=2)
-      batch.xyz_mapBs[invalid.expand(bs,3,-1,-1)] = 0
+      batch.xyz_mapBs.masked_fill_(invalid.expand(bs,3,-1,-1), 0)  # (speedopt) no sync
 
     return batch
 
@@ -149,7 +151,9 @@ class TripletH5Dataset(PairH5Dataset):
     H,W = batch.rgbAs.shape[-2:]
     mesh_radius = batch.mesh_diameters.cuda()/2
     tf_to_crops = batch.tf_to_crops.cuda()
-    crop_to_oris = batch.tf_to_crops.inverse().cuda()  #(B,3,3)
+    # (speedopt) the inverse is only needed to build an xyz map from depth; .inverse() syncs
+    crop_to_oris = (torch.linalg.inv_ex(batch.tf_to_crops)[0].cuda()
+                    if (batch.xyz_mapAs is None or batch.xyz_mapBs is None) else None)  #(B,3,3)
     batch.poseA = batch.poseA.cuda()
     batch.Ks = batch.Ks.cuda()
 
@@ -161,7 +165,7 @@ class TripletH5Dataset(PairH5Dataset):
     if self.cfg['normalize_xyz']:
       batch.xyz_mapAs *= 1/mesh_radius.reshape(bs,1,1,1)
       invalid = invalid.expand(bs,3,-1,-1) | (torch.abs(batch.xyz_mapAs)>=2)
-      batch.xyz_mapAs[invalid.expand(bs,3,-1,-1)] = 0
+      batch.xyz_mapAs.masked_fill_(invalid.expand(bs,3,-1,-1), 0)  # (speedopt) no sync
 
     if batch.xyz_mapBs is None:
       batch.xyz_mapBs = _crop_depth_to_xyzmap(batch.depthBs.cuda().expand(bs,-1,-1,-1), batch.Ks, crop_to_oris, tf_to_crops, H_ori, W_ori, H, W)  #(B,3,H,W)
@@ -171,7 +175,7 @@ class TripletH5Dataset(PairH5Dataset):
     if self.cfg['normalize_xyz']:
       batch.xyz_mapBs *= 1/mesh_radius.reshape(bs,1,1,1)
       invalid = invalid.expand(bs,3,-1,-1) | (torch.abs(batch.xyz_mapBs)>=2)
-      batch.xyz_mapBs[invalid.expand(bs,3,-1,-1)] = 0
+      batch.xyz_mapBs.masked_fill_(invalid.expand(bs,3,-1,-1), 0)  # (speedopt) no sync
 
     return batch
 

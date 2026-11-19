@@ -872,7 +872,8 @@ def _build_parser():
                         help='Fixes that keep failing double the cooldown up to this (re-registration blocks ~0.6 s).')
     parser.add_argument('--lost_mask_max_ratio', type=float, default=3.0,
                         help='Re-register from SAM2 only if its mask is <= this x the registration mask (not the hand).')
-    parser.add_argument('--arbitrate', nargs='?', const='depth', default='off', choices=['off', 'depth', 'color'],
+    parser.add_argument('--arbitrate', nargs='?', const='depth', default='off',
+                        choices=['off', 'depth', 'color', 'appearance'],
                         help='(19 Nov) Before trusting a SAM2-vs-FoundationPose disagreement, check FoundationPose '
                              'against the observed depth. If SAM2\'s mask grew past --bleed_ratio x the whole '
                              'silhouette while the pose explains the depth (fit >= --fit_ok), SAM2 bled onto the '
@@ -891,6 +892,40 @@ def _build_parser():
                         help='--arbitrate color: the pose is trusted when its rendered colours differ from the image by '
                              'less than this (mean |rgb|, 0-1) on >= --color_min_px visible pixels.')
     parser.add_argument('--color_bad', type=float, default=0.22)
+    parser.add_argument('--app_good', type=float, default=0.30,
+                        help='--arbitrate appearance (v9, 19 Nov): the pose is trusted when the HSV histogram of its '
+                             'visible pixels is within this distance of the nearest reference view; references are '
+                             'learned from the real object (first checks after registration, then trusted frames).')
+    parser.add_argument('--app_bad', type=float, default=0.50)
+    parser.add_argument('--app_bank', type=int, default=16, help='Max reference views kept.')
+    parser.add_argument('--app_min_bank', type=int, default=5,
+                        help='No appearance verdicts until this many reference views are learned (a fresh bank of 1-3 '
+                             'views mis-judged correct poses in sim).')
+    parser.add_argument('--app_new', type=float, default=0.10,
+                        help='Add a trusted view to the references only if it is at least this far from all of them.')
+    parser.add_argument('--hand_check', choices=['off', 'replay', 'ros'], default='off',
+                        help='(19 Nov) While the tool is held, the tracked tool must stay near the hand\'s grasp centre '
+                             '(mean of the 4 fingers\' PP+MP links; ros: forward kinematics of /iiwa/joint_states + '
+                             '/sharpa/joint_states; replay: <replay_dir>/hand_center.npy). Tracked tool farther than '
+                             '--hand_max_dist for --hand_frames frames = lost; a re-registration far from the hand is '
+                             'rejected. Allows in-hand reorientation (distance only, no fixed grasp offset). Needs '
+                             '--sam2_tool and the calibration (T_RC).')
+    parser.add_argument('--hand_max_dist', type=float, default=0.10)
+    parser.add_argument('--hand_hold_dist', type=float, default=0.05,
+                        help='Held when the tracked tool is this close to the grasp centre for 3 checks.')
+    parser.add_argument('--hand_release_dist', type=float, default=0.30,
+                        help='Released when the nearest 10%% of SAM2\'s mask (3D) is this far from the grasp centre for '
+                             '5 checks in a row.')
+    parser.add_argument('--hand_frames', type=int, default=3)
+    parser.add_argument('--catchup_iter', type=int, default=0,
+                        help='(19 Nov) Track iterations on the first frame after a re-registration (the tool moved '
+                             'while register() blocked). 0 = normal --track_refine_iter.')
+    parser.add_argument('--rereg_rot_subsample', type=int, default=1,
+                        help='Re-registration when lost uses every k-th rotation hypothesis (faster; 1 = all 252).')
+    parser.add_argument('--lost_text_redetect', action='store_true',
+                        help='(19 Nov) When lost and SAM2\'s mask is unusable (empty / too large), get a fresh mask '
+                             'from SAM3 text (--redetect_prompt) and re-register + re-seed SAM2 on it (~0.3 s).')
+    parser.add_argument('--redetect_prompt', type=str, default=None, help='Default: --text_prompt.')
     parser.add_argument('--color_bad_checks', type=int, default=3,
                         help='--arbitrate color: lost after this many checks in a row with colour error > --color_bad, '
                              'even if SAM2 agrees (catches poses on the hand and upside-down tools).')
@@ -907,7 +942,7 @@ def _build_parser():
     parser.add_argument('--flip_axes', type=str, default='x', help='Subset of xyz, e.g. x or xz.')
     parser.add_argument('--flip_refine_iter', type=int, default=1)
     parser.add_argument('--flip_margin', type=float, default=0.0, help='scorer judge: score margin to switch.')
-    parser.add_argument('--flip_judge', choices=['color', 'scorer'], default='color',
+    parser.add_argument('--flip_judge', choices=['color', 'scorer', 'appearance'], default='color',
                         help='color: render the textured mesh at each candidate and compare with the image on its '
                              'visible, unoccluded pixels (the scorer\'s margins between twins were bf16 noise in '
                              'sim); switch if the twin\'s colour error < --flip_ratio x the current one.')
@@ -1232,6 +1267,11 @@ def main():
                 T0 = poses[o.k][0] if poses[o.k] else None
                 m = _rt.ToolCheck(o.mesh, K, args.width, args.height).silhouette(T0)
                 cv2.imwrite(os.path.join(rd, f'masks_{o.k + 1}', '00000.png'), (m * 255).astype(np.uint8))
+            _rl = list(robust_log)
+            if any(r.get('hand_c') is not None for r in _rl):
+                # grasp centre per frame, so a replay can run --hand_check replay (NaN where unknown)
+                hcs = [(_rl[i].get('hand_c') if i < len(_rl) else None) or [float('nan')] * 3 for i in range(n)]
+                np.save(os.path.join(rd, 'hand_center.npy'), np.asarray(hcs, np.float64))
             print(f'[save_depth] wrote {rd} ({n} frames, {time.time() - _t_d:.1f}s)', flush=True)
         return take_dir
 
@@ -1465,7 +1505,7 @@ def main():
         def _forced(o):
             return args.force_upright and o.upright
 
-        def _register(o, rgb, depth, mask):
+        def _register(o, rgb, depth, mask, fast=False):
             """est.register(); for an upright part keep the copy whose +z
             points up, turning FoundationPose's own state over so track_one()
             keeps it. With --force_upright, register from upright guesses
@@ -1475,6 +1515,9 @@ def main():
                 grid = o.est.rot_grid
                 o.est.rot_grid = torch.as_tensor(_upright_rot_grid(), device=grid.device,
                                                  dtype=grid.dtype)
+            elif fast and args.rereg_rot_subsample > 1:
+                grid = o.est.rot_grid
+                o.est.rot_grid = grid[::args.rereg_rot_subsample]
             prev = o.est.pose_last
             o.est.pose_last = None      # register() leaves it unset when it gives up
             try:
@@ -1531,6 +1574,12 @@ def main():
         if args.sam2_tool or args.end_tag_id >= 0:
             import robust_tool
             robust_tool.RICH_PROMPT = not args.sam2_simple_prompt
+            if args.lost_text_redetect:
+                # load SAM3 now, not on the first loss (a cold load blocks the loop for seconds)
+                from text_mask import _cpu_default_tensor, _load_sam3
+                with _cpu_default_tensor():
+                    _load_sam3('facebook/sam3')
+                print('[redetect] SAM3 text model loaded', flush=True)
         if args.sam2_tool:
             _t = time.time()
             sam = robust_tool.SamTool(ckpt=args.sam2_ckpt or robust_tool.SAM2_CKPT,
@@ -1691,7 +1740,28 @@ def main():
                                          ob_in_cams=cand.data.cpu().numpy(), normal_map=None, xyz_map=xyz,
                                          mesh_diameter=est.diameter, glctx=est.glctx,
                                          iteration=args.flip_refine_iter, get_vis=False)
-            if args.flip_judge == 'scorer':
+            if args.flip_judge == 'appearance':
+                from Utils import nvdiffrast_render
+                bank = robust_state.get('app_bank', [])
+                if len(bank) < args.app_min_bank:
+                    return '', np.zeros(len(ref))
+                _, dep, _ = nvdiffrast_render(K=K, H=d.shape[0], W=d.shape[1], ob_in_cams=ref.float(),
+                                              glctx=est.glctx, mesh_tensors=est.mesh_tensors)
+                errs, npx = [], []
+                for i in range(len(ref)):
+                    vis_i = ((dep[i] > 0) & (d > 0.05) & (d >= dep[i] - args.fit_tol)).cpu().numpy()
+                    n = int(vis_i.sum())
+                    npx.append(n)
+                    if n < 200:
+                        errs.append(float('inf'))
+                        continue
+                    h = robust_tool.appearance_hist(rgb, vis_i)
+                    errs.append(min(robust_tool.appearance_dist(h, r) for r in bank))
+                sc = np.array(errs)
+                b = int(np.argmin(sc))
+                if b == 0 or npx[b] < args.flip_min_px or npx[0] < args.flip_min_px or sc[b] >= args.flip_ratio * sc[0]:
+                    return '', sc
+            elif args.flip_judge == 'scorer':
                 sc, _ = est.scorer.predict(mesh=est.mesh, rgb=rgb, depth=d, K=K, ob_in_cams=ref.data.cpu().numpy(),
                                            normal_map=None, mesh_tensors=est.mesh_tensors, glctx=est.glctx,
                                            mesh_diameter=est.diameter, get_vis=False)
@@ -1718,6 +1788,86 @@ def main():
             o.pose = (ref[b] @ est.get_tf_to_centered_mesh()).data.cpu().numpy().reshape(4, 4)
             return args.flip_axes[b - 1], sc
 
+        REFEREE = ('color', 'appearance')
+
+        def _q_thr():
+            return (args.color_good, args.color_bad) if args.arbitrate == 'color' else (args.app_good, args.app_bad)
+
+        def _quality(rgb, depth, T):
+            """(err, n visible px, mask of matching/visible px, extra). color: mesh-colour error; appearance: distance
+            of the visible pixels' HSV histogram to the nearest learned reference view (NaN while no reference)."""
+            if args.arbitrate == 'color':
+                ce, n, good = check.color_err(rgb, depth, T, args.fit_tol)
+                return ce, n, good, {}
+            ck = check.checks(rgb, depth, T, args.fit_tol)
+            if ck['vis'] is None:
+                return float('nan'), ck['n_vis'], None, {}
+            h = robust_tool.appearance_hist(rgb, ck['vis'])
+            bank = robust_state.setdefault('app_bank', [])
+            err = min(robust_tool.appearance_dist(h, r) for r in bank) if bank else float('nan')
+            return err, ck['n_vis'], ck['vis'], dict(h=h, fit=ck['fit'])
+
+        def _app_learn(h, trusted, err):
+            """Add a view to the appearance references: the first 3 checked views after start-up (registration is
+            trusted), later only trusted views that look new."""
+            bank = robust_state.setdefault('app_bank', [])
+            if h is None or len(bank) >= args.app_bank:
+                return
+            if len(bank) < 3 and robust_state['frame'] <= 30:
+                bank.append(h)
+            elif trusted and (not np.isfinite(err) or err > args.app_new):
+                bank.append(h)
+
+        _hand = dict(src=None, held=False, n_near=0, n_far=0, arm=None, hand=None, urdf=None, links=None)
+        _brush_pts = np.asarray(objs[0].mesh.vertices, np.float64)[::20]
+
+        def _hand_center():
+            """Grasp centre (robot frame) for this frame, or None."""
+            if args.hand_check == 'replay':
+                if _hand['src'] is None:
+                    _hand['src'] = np.load(Path(args.replay_dir) / 'hand_center.npy')
+                try:
+                    c = _hand['src'][int(capture.frame_name)]
+                    return c if np.all(np.isfinite(c)) else None
+                except (TypeError, ValueError, IndexError):
+                    return None
+            if args.hand_check == 'ros':
+                if _hand['urdf'] is None:
+                    import rospy as _rp
+                    from sensor_msgs.msg import JointState as _JS
+                    import calibrate_camera as _cal
+                    _hand['urdf'] = _cal.Urdf()
+                    _hand['joint_map'] = _cal.joint_map
+                    _hand['links'] = [f'left_{f}_{s}' for f in ('index', 'middle', 'ring', 'pinky') for s in ('PP', 'MP')]
+                    _rp.Subscriber('/iiwa/joint_states', _JS, lambda m: _hand.__setitem__('arm', m), queue_size=1)
+                    _rp.Subscriber('/sharpa/joint_states', _JS, lambda m: _hand.__setitem__('hand', m), queue_size=1)
+                    print('[hand] forward kinematics from /iiwa/joint_states + /sharpa/joint_states', flush=True)
+                if _hand['arm'] is None:
+                    return None
+                fk = _hand['urdf'].fk(_hand['joint_map'](_hand['urdf'], _hand['arm'], _hand['hand']))
+                return np.mean([fk[l][:3, 3] for l in _hand['links'] if l in fk], 0)
+            return None
+
+        def _hand_dist(T, c):
+            Tr = T_up @ T
+            return float(np.min(np.linalg.norm(_brush_pts @ Tr[:3, :3].T + Tr[:3, 3] - c, axis=1)))
+
+        def _mask_near_dist(mask, depth, hc):
+            """10th-percentile distance (m) from the grasp centre to the mask's 3D points (robot frame): a held tool
+            always has visible pixels near the hand, a long tool's far end does not count against it."""
+            ys, xs = np.nonzero(mask)
+            if len(ys) < 50:
+                return None
+            sel = np.linspace(0, len(ys) - 1, min(len(ys), 2000)).astype(int)
+            ys, xs = ys[sel], xs[sel]
+            z = depth[ys, xs]
+            ok = z > 0.05
+            if ok.sum() < 30:
+                return None
+            pc = np.stack([(xs[ok] - K[0, 2]) / K[0, 0] * z[ok], (ys[ok] - K[1, 2]) / K[1, 1] * z[ok], z[ok]], 1)
+            pr = pc @ T_up[:3, :3].T + T_up[:3, 3]
+            return float(np.percentile(np.linalg.norm(pr - hc, axis=1), 10))
+
         def _fp_visible_mask(match):
             """Largest blob of FoundationPose's depth-matching pixels (closed), to re-seed SAM2."""
             m = cv2.morphologyEx(match.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
@@ -1732,8 +1882,8 @@ def main():
             1 - colour error (0 when hidden)."""
             if T is None or not np.isfinite(T).all():
                 return 0.0
-            if args.arbitrate == 'color':
-                ce, n, _ = check.color_err(rgb, depth, T, args.fit_tol)
+            if args.arbitrate in REFEREE:
+                ce, n, _, _ = _quality(rgb, depth, T)
                 if np.isfinite(ce) and n >= args.color_min_px:
                     return 1.0 - ce
                 # Too little of it visible to judge colour: fall back to the depth-mode score, scaled into
@@ -1742,7 +1892,7 @@ def main():
             cover = (mask & sil).sum() / max(int(mask.sum()), 1)
             fit, _, nrest = check.depth_fit(depth, T, args.fit_tol)
             sc = float(cover) * (float(fit) if np.isfinite(fit) else 0.0)
-            return 0.5 * sc if args.arbitrate == 'color' else sc
+            return 0.5 * sc if args.arbitrate in REFEREE else sc
 
         def _robust_step(o, rgb, depth):
             """The end-face tag (roll / end position fix), SAM2's mask, the check, and the fix when lost (object 1
@@ -1825,15 +1975,25 @@ def main():
                 robust_state['last_iou'] = c['iou']
                 row.update({k: c[k] for k in ('iou', 'dpx', 'badness', 'bad', 'lost', 'sam_px', 'fp_px', 'usable')})
                 row['cover'] = c.get('cover', float('nan'))
-                if args.arbitrate == 'color' and o.pose is not None and (
+                if args.arbitrate in REFEREE and o.pose is not None and (
                         robust_state['frame'] % max(args.color_every, 1) == 0 or c['bad']):
-                    ce, ce_n, ce_good = check.color_err(rgb, depth, o.pose, args.fit_tol)
+                    ce, ce_n, ce_good, qx = _quality(rgb, depth, o.pose)
+                    q_good, q_bad = _q_thr()
                     row['ce'], row['ce_px'] = ce, ce_n
+                    if args.arbitrate == 'appearance':
+                        trusted = (c.get('usable') and not c['bad'] and (c.get('cover') or 0) >= 0.85
+                                   and (c.get('iou') or 0) >= 0.6 and (qx.get('fit') or 0) >= 0.8
+                                   and not (np.isfinite(ce) and ce > q_bad)
+                                   and not (_hand['held'] and _hand['n_far'] > 0))
+                        _app_learn(qx.get('h'), trusted, ce)
+                        row['app_bank'] = len(robust_state.get('app_bank', []))
                     seen = np.isfinite(ce) and ce_n >= args.color_min_px
-                    fp_good = seen and ce < args.color_good
-                    robust_state['n_cbad'] = robust_state.get('n_cbad', 0) + 1 if (seen and ce > args.color_bad) else 0
+                    if args.arbitrate == 'appearance' and len(robust_state.get('app_bank', [])) < args.app_min_bank:
+                        seen = False                 # not enough reference views yet: no verdict
+                    fp_good = seen and ce < q_good
+                    robust_state['n_cbad'] = robust_state.get('n_cbad', 0) + 1 if (seen and ce > q_bad) else 0
                     robust_state['n_cmid'] = (robust_state.get('n_cmid', 0) + 1
-                                              if (seen and args.color_good <= ce <= args.color_bad) else 0)
+                                              if (seen and q_good <= ce <= q_bad) else 0)
                     disagree = c.get('usable') and (c['bad'] or c['sam_px'] > args.bleed_ratio * max(c['fp_px'], 1))
                     if fp_good and disagree:
                         # SAM2 disagrees, but the pose's rendered colours match the image: trust the pose and
@@ -1875,39 +2035,97 @@ def main():
                                 robust_state['last_sam_reseed'] = now
                                 robust_state['n_sam_reseed'] = robust_state.get('n_sam_reseed', 0) + 1
                                 row['action'] = 'sam2_reseed_from_fp (bleed)'
+                if args.hand_check != 'off' and o.pose is not None:
+                    hc = _hand_center()
+                    if hc is not None:
+                        dn = _hand_dist(o.pose, hc)
+                        row['hand_d'] = dn
+                        row['hand_c'] = [float(x) for x in hc]     # saved to replay/hand_center.npy (--save_depth)
+                        dm = _mask_near_dist(mask, depth, hc) if (mask is not None and c.get('usable')) else None
+                        dm = float('nan') if dm is None else dm
+                        row['hand_dm'] = dm
+                        if not _hand['held']:
+                            _hand['n_near'] = _hand['n_near'] + 1 if (dn < args.hand_hold_dist and not c['bad']) else 0
+                            if _hand['n_near'] >= 3:
+                                _hand['held'] = True
+                                print('\n[hand] object 1 is held', flush=True)
+                        else:
+                            _hand['n_rel'] = _hand.get('n_rel', 0) + 1 if (np.isfinite(dm) and dm > args.hand_release_dist) else 0
+                            if _hand['n_rel'] >= 5:
+                                _hand.update(held=False, n_near=0, n_far=0, n_rel=0)
+                                print('\n[hand] object 1 released (SAM2 mask away from the hand)', flush=True)
+                        _hand['n_far'] = _hand['n_far'] + 1 if (_hand['held'] and dn > args.hand_max_dist) else 0
+                        row['held'] = _hand['held']
+                        if _hand['n_far'] >= args.hand_frames:
+                            c['lost'] = True
+                            row['lost'] = True
+                            row['why'] = 'hand'
                 if c['lost']:
                     robust_state['n_lost'] += 1
                 if (c['lost'] and args.lost_action == 'reregister'
                         and now - robust_state['last_fix'] > robust_state.get('cooldown', args.lost_cooldown_s)):
                     T = reseed_msg['T'] if now - reseed_msg['t'] < args.reseed_max_age_s else None
                     sam_ok = 0 < c['sam_px'] <= args.lost_mask_max_ratio * max(robust_state['mask0_px'], 1)
+                    if not sam_ok and args.lost_text_redetect and T is None:
+                        # SAM2's mask is empty or far too large: ask SAM3 text for a fresh one (~0.3 s)
+                        _t = time.time()
+                        try:
+                            from text_mask import _cpu_default_tensor
+                            with _cpu_default_tensor():   # FoundationPose's cuda default tensor type breaks HF loading
+                                tm, tsc = _mask_from_text_joined(
+                                    rgb, (args.redetect_prompt or args.text_prompt or objs[0].name).replace('_', ' '),
+                                    0, args.text_backend, args.text_min_score)
+                        except Exception as exc:  # noqa: BLE001
+                            tm, tsc = None, 0.0
+                            print(f'\n[redetect] SAM3 text failed: {exc}', flush=True)
+                        n_tm = 0 if tm is None else int(np.asarray(tm).astype(bool).sum())
+                        row['redetect_px'], row['redetect_ms'] = n_tm, (time.time() - _t) * 1e3
+                        if 0 < n_tm <= args.lost_mask_max_ratio * max(robust_state['mask0_px'], 1):
+                            mask = np.asarray(tm).astype(bool)
+                            sam.reset(rgb, mask)
+                            sam_ok = True
+                            row['action'] = 'sam3_text_redetect; '
                     if T is not None and not (args.reseed_message_action == 'register' and sam_ok):
                         _set_state(o, T)
                         row['action'] = 'reseed_node'
                     elif sam_ok and args.lost_try_anchor and _try_anchor(o, rgb, depth, mask):
                         row['action'] = 'anchor_sam2'
+                        robust_state['catchup'] = True
                     elif sam_ok:
                         try:
                             old_pose, old_pl = o.pose, o.est.pose_last.clone()
                             s_old = _arb_score(mask, old_pose, depth, rgb) if args.arbitrate != 'off' else 0.0
-                            newT = _register(o, rgb, depth, mask)
+                            newT = _register(o, rgb, depth, mask, fast=True)
                             s_new = _arb_score(mask, newT, depth, rgb) if args.arbitrate != 'off' else 1.0
-                            # colour mode: an old pose that is clearly wrong (colour error > --color_bad, i.e.
-                            # score < 1 - color_bad) or unjudgeable needs no margin, only "no worse".
-                            old_bad = args.arbitrate == 'color' and s_old < 1.0 - args.color_bad
-                            if s_new >= s_old + (0.0 if old_bad else args.verify_margin) or (
-                                    args.arbitrate == 'color' and s_new >= 1.0 - args.color_good):
+                            # referee modes: an old pose that is clearly wrong (error > bad threshold, i.e.
+                            # score < 1 - bad) or unjudgeable needs no margin, only "no worse".
+                            q_good, q_bad = _q_thr()
+                            old_bad = args.arbitrate in REFEREE and s_old < 1.0 - q_bad
+                            accept = s_new >= s_old + (0.0 if old_bad else args.verify_margin) or (
+                                args.arbitrate in REFEREE and s_new >= 1.0 - q_good)
+                            if args.hand_check != 'off' and _hand['held']:
+                                hc = _hand_center()
+                                if hc is not None:
+                                    d_new, d_old = _hand_dist(newT, hc), _hand_dist(old_pose, hc)
+                                    row['hand_d_new'] = d_new
+                                    if d_new > args.hand_max_dist and not (args.arbitrate == 'off' and d_new < d_old):
+                                        accept = False      # a held tool cannot be away from the hand
+                                    elif args.arbitrate == 'off' or d_old > args.hand_max_dist:
+                                        accept = accept or d_new <= args.hand_max_dist
+                            if accept:
                                 o.pose = newT
-                                row['action'] = 'reregister_sam2'
+                                row['action'] = row.get('action', '') + 'reregister_sam2'
+                                robust_state['catchup'] = True
+                                _hand['n_far'] = 0
                                 if pose_filter is not None:
                                     pose_filter.reset()
                             else:
                                 # The re-registration explains SAM2's mask + the depth no better: keep tracking.
                                 o.est.pose_last, o.pose = old_pl, old_pose
                                 row['action'] = f'reregister_rejected ({s_new:.2f} vs {s_old:.2f})'
-                                if args.arbitrate == 'color':
-                                    ce, ce_n, ce_good = check.color_err(rgb, depth, old_pose, args.fit_tol)
-                                    ok_old = np.isfinite(ce) and ce_n >= args.color_min_px and ce < args.color_good
+                                if args.arbitrate in REFEREE:
+                                    ce, ce_n, ce_good, _ = _quality(rgb, depth, old_pose)
+                                    ok_old = np.isfinite(ce) and ce_n >= args.color_min_px and ce < _q_thr()[0]
                                     vm = _fp_visible_mask(ce_good) if ok_old else None
                                 else:
                                     fit, match, _ = check.depth_fit(depth, old_pose, args.fit_tol)
@@ -2166,8 +2384,10 @@ def main():
                                                               dtype=o.est.pose_last.dtype).reshape(o.est.pose_last.shape)
                     if fpp_on and o.k == 0:
                         _depth_o, _fpp_row = _fpp_pre(o, rgb, depth)
-                    o.pose = o.est.track_one(rgb=rgb, depth=_depth_o, K=K,
-                                             iteration=args.track_refine_iter)
+                    _it = args.track_refine_iter
+                    if o.k == 0 and args.catchup_iter > 0 and robust_state.pop('catchup', False):
+                        _it = args.catchup_iter       # first frame after a re-registration: catch up
+                    o.pose = o.est.track_one(rgb=rgb, depth=_depth_o, K=K, iteration=_it)
                     if pose_filter is not None and o.k == 0:
                         pose_filter.update(o.est.pose_last.reshape(-1, 4, 4)[0].detach().cpu().numpy())
                     if _forced(o):

@@ -39,3 +39,18 @@ Limits: kinematic grasp (no finger contact), MuJoCo shading, white hand, plain b
   thresholds live until recalibrated / replaced (see the 19 Nov message).
 - `FPSIM_CAM` = zed2_172707 (current) | zed2_161129 (previous diagonal) | zed1 selects the camera; `batch_cam.sh`.
 - `timing.py`: register 0.57 s (iter 2) / 0.98 s (iter 5), track_one ~20-40 ms, colour check 2 ms (shared GPU).
+
+## 19 Nov, v9 work (branch 2026-11-19_TrackerV9)
+New tracker flags (all off by default; `live_tracking_robust_2_objects.py --help`):
+- `--arbitrate appearance` + `--flip_judge appearance`: the referee learns the tool's look (HSV histogram of its
+  visible pixels) from the real images: the first checks after registration, then trusted frames that look new
+  (`--app_bank` views). Thresholds `--app_good` / `--app_bad` are placeholders until calibrated on real
+  `--save_depth --log_checks` rollouts.
+- `--hand_check replay|ros`: while held, the tracked tool's nearest point must stay within `--hand_max_dist` (10 cm)
+  of the grasp centre (mean of the 4 fingers' PP+MP links). `ros` = forward kinematics of /iiwa/joint_states +
+  /sharpa/joint_states with calibrate_camera.Urdf; `replay` = <replay_dir>/hand_center.npy (sim takes:
+  `gen_take.py --hand_only`). Sim: true held distance 1.7 cm; "> 10 cm" flags 84% of lost frames, 0% false alarms
+  (`hand_dist_eval.py`). Distance only, so in-hand reorientation is allowed.
+- `--catchup_iter N`: extra track iterations on the first frame after a re-registration.
+- `--rereg_rot_subsample k`: lost re-registration from every k-th rotation hypothesis (faster).
+- `--lost_text_redetect --redetect_prompt "red brush"`: SAM3 text mask when SAM2's mask is unusable on a lost frame.

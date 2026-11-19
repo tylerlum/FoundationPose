@@ -41,7 +41,7 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
   xyz_map_rs = []
 
   bbox2d_crop = torch.as_tensor(np.array([0, 0, cfg['input_resize'][0]-1, cfg['input_resize'][1]-1]).reshape(2,2), device='cuda', dtype=torch.float)
-  bbox2d_ori = transform_pts(bbox2d_crop, tf_to_crops.inverse()).reshape(-1,4)
+  bbox2d_ori = transform_pts(bbox2d_crop, torch.linalg.inv_ex(tf_to_crops)[0]).reshape(-1,4)  # (speedopt) no sync
 
   for b in range(0,len(poseA),bs):
     extra = {}

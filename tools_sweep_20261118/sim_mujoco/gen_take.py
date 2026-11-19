@@ -177,10 +177,14 @@ def main():
     ap.add_argument('--curl', type=float, default=0.8)
     ap.add_argument('--vmax', type=float, default=0.9, help='peak brush speed m/s (real takes: p95 0.5-0.9)')
     ap.add_argument('--wmax', type=float, default=350.0, help='peak brush turn rate deg/s (real: p95 ~300)')
+    ap.add_argument('--hand_only', action='store_true',
+                    help='Re-run the same (deterministic) motion without rendering; write the hand poses of an existing '
+                         'take: replay/hand_T.npy (palm, robot frame), replay/hand_center.npy (grasp centre = mean of '
+                         'the four fingers PP+MP bodies) and check the brush poses match gt/T_world_brush.npy.')
     a = ap.parse_args()
     out = Path(a.out)
     rd = out / 'replay'
-    for sub in ('rgb', 'right', 'depth_gt', 'masks_1', 'masks_2'):
+    for sub in (() if a.hand_only else ('rgb', 'right', 'depth_gt', 'masks_1', 'masks_2')):
         (rd / sub).mkdir(parents=True, exist_ok=True)
     (out / 'gt').mkdir(exist_ok=True)
 
@@ -203,7 +207,11 @@ def main():
     print('keyframe times', [round(k[0], 2) for k in keys])
     n = int(round(keys[-1][0] * a.fps)) + 1
     sub = int(round(1 / (a.fps * model.opt.timestep)))
-    ren = mujoco.Renderer(model, S.H, S.W)
+    ren = None if a.hand_only else mujoco.Renderer(model, S.H, S.W)
+    hand_T, hand_c, q_arm, q_hand = [], [], [], []
+    hand_jids = S.hand_joint_ids(model)
+    hand_names = [model.joint(j).name.replace('palmleft_', 'left_') for j in hand_jids]
+    grip_bodies = [model.body(f'palmleft_{f}_{p}').id for f in ('index', 'middle', 'ring', 'pinky') for p in ('PP', 'MP')]
     opt_brush = mujoco.MjvOption()
     opt_brush.geomgroup[:] = 0
     opt_brush.geomgroup[2] = 1
@@ -211,10 +219,11 @@ def main():
     gid_b, gid_c = model.geom('brush_geom').id, model.geom('cube_geom').id
     Tinv = np.linalg.inv(T_RC)
     cam_brush, cam_cube, w_brush, w_cube, vis, pxs, att, ik_err = [], [], [], [], [], [], [], []
-    np.savetxt(rd / 'cam_K.txt', S.K960)
+    if not a.hand_only:
+        np.savetxt(rd / 'cam_K.txt', S.K960)
     prev_q = data.qpos[arm_q].copy()
     brush_free = T_of(R_REST, [*BRUSH_REST_XY, TT + BRUSH_Y_HALF])
-    writer = imageio.get_writer(out / 'preview.mp4', fps=a.fps, codec='libx264', macro_block_size=1)
+    writer = None if a.hand_only else imageio.get_writer(out / 'preview.mp4', fps=a.fps, codec='libx264', macro_block_size=1)
     ts_lines = []
     # put the arm at frame 0 (multi-start IK), then settle the cube
     k0 = interp(keys, 0.0)[0]
@@ -264,6 +273,13 @@ def main():
         S.set_free(model, data, 'brush_free', brush_free)
         mujoco.mj_forward(model, data)
         Tb_w, Tc_w = S.body_T(model, data, 'brush'), S.body_T(model, data, 'cube')
+        hand_T.append(S.body_T(model, data, S.PALM))
+        hand_c.append(np.mean([data.xpos[b] for b in grip_bodies], 0))
+        q_arm.append(data.qpos[arm_q].copy())
+        q_hand.append(np.array([data.qpos[model.jnt_qposadr[j]] for j in hand_jids]))
+        if a.hand_only:
+            w_brush.append(Tb_w)
+            continue
 
         ren.update_scene(data, 'zed_left')
         rgb = ren.render().copy()
@@ -305,6 +321,15 @@ def main():
         if i % 30 == 0:
             print(f'{a.scenario} t={t:4.1f}s ik {perr * 1000:5.1f} mm {rerr:4.1f} deg  brush vis {vis[-1]:.2f} '
                   f'({pxs[-1]} px)  attached {attached}  cube z {Tc_w[2, 3]:.3f}', flush=True)
+    np.save(rd / 'hand_T.npy', np.asarray(hand_T))          # world == robot frame
+    np.save(rd / 'hand_center.npy', np.asarray(hand_c))
+    np.savez(rd / 'joints.npz', q_arm=np.asarray(q_arm), q_hand=np.asarray(q_hand),
+             arm_names=np.array([f'iiwa14_joint_{i}' for i in range(1, 8)]), hand_names=np.array(hand_names))
+    if a.hand_only:
+        ref = np.load(out / 'gt' / 'T_world_brush.npy')
+        d = np.abs(np.asarray(w_brush) - ref).max()
+        print(f'hand poses written for {out} ({len(hand_T)} frames); brush pose max |diff| vs saved take: {d:.2e}')
+        return
     writer.close()
     (rd / 'ts_ns.txt').write_text('\n'.join(ts_lines) + '\n')
     for k, v in dict(T_cam_brush=cam_brush, T_cam_cube=cam_cube, T_world_brush=w_brush, T_world_cube=w_cube,

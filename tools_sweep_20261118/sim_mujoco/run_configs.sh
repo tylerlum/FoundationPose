@@ -19,13 +19,31 @@ declare -A CFG=(
   [v4np]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor"
   [v4npb]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor"
   [rec]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --log_checks"
+  [v9]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --arbitrate appearance --flip_check_every 3 --flip_judge appearance --lost_max_cooldown_s 2"
+  [v9h]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --arbitrate appearance --flip_check_every 3 --flip_judge appearance --lost_max_cooldown_s 2 --hand_check replay @CAL@"
+  [v9hct]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --arbitrate appearance --flip_check_every 3 --flip_judge appearance --lost_max_cooldown_s 2 --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_text_redetect --redetect_prompt red_brush"
+  [v4h]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@"
+  [v4hc]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2"
+  [v9b]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --arbitrate appearance --flip_check_every 3 --flip_judge appearance --lost_max_cooldown_s 2"
+  [v9hb]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --arbitrate appearance --flip_check_every 3 --flip_judge appearance --lost_max_cooldown_s 2 --hand_check replay @CAL@"
+  [v9hctb]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --arbitrate appearance --flip_check_every 3 --flip_judge appearance --lost_max_cooldown_s 2 --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_text_redetect --redetect_prompt red_brush"
+  [v4hb]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@"
+  [v4hcb]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2"
+  [v9nf]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --arbitrate appearance --lost_max_cooldown_s 2"
+  [v9hcnf]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2 --arbitrate appearance"
+  [v4hcc]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2"
+  [v8c]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --arbitrate color --flip_check_every 3 --lost_max_cooldown_s 2"
+  [v4npc]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor"
+  [plainb]=""
+  [v4hct]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2 --lost_text_redetect --redetect_prompt red_brush"
+  [v4hctb]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2 --lost_text_redetect --redetect_prompt red_brush"
   [v4_sync]="--sam2_tool --sam2_image_size 640 --sam2_every 2 --lost_metric cover --lost_try_anchor"
 )
 suffix=""; [ "$RP" = replay_gtdepth ] && suffix=_gt; [ -n "$RT" ] && [ "$RT" != "0" ] && suffix="${suffix}_rt"
 for name in $CFGS; do
-  out=$R/runs/$TAKE$suffix/$name; rm -rf "$out"; mkdir -p "$out"
-  cd $FP && $PY live_tracking_robust_2_objects.py --replay_dir "$R/takes/$TAKE/$RP" --replay_realtime_scale ${RT:-0} --mask_mode replay \
+  out=$S/runs/$TAKE$suffix/$name; rm -rf "$out"; mkdir -p "$out"
+  cd $FP && $PY live_tracking_robust_2_objects.py --replay_dir "$S/takes/$TAKE/$RP" --replay_realtime_scale ${RT:-0} --mask_mode replay \
     --headless --no_auto_record --mesh_path $M/red_brush/red_brush.obj --mesh_path_2 $M/cube_29mm_gold.obj \
-    --object_name_2 cube_29mm --upright_meshes cube_29mm_gold --save_dir "$out" ${CFG[$name]} $EXTRA > "$out/log.txt" 2>&1
+    --object_name_2 cube_29mm --upright_meshes cube_29mm_gold --save_dir "$out" $(echo "${CFG[$name]}" | sed "s|@CAL@|--calibration $R/takes/$TAKE/gt/T_RC.txt|") $EXTRA > "$out/log.txt" 2>&1
   echo "$TAKE$suffix $name exit $?"
 done

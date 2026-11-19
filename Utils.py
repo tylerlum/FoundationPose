@@ -1018,3 +1018,19 @@ def make_yaml_dumpable(D):
         D[d][i] = make_yaml_dumpable(D[d][i])
       continue
   return dict(D)
+
+
+
+# (speedopt round 2, 19 Nov 2026) kornia's warp_perspective / normalize_homography invert 3x3 homographies with
+# torch.linalg.inv, which copies an error flag to the host after every call (a GPU sync; ~8 per track_one).
+# torch.linalg.inv_ex runs the same kernel without the check, so the values are identical.
+def _inv_nosync(input):
+  dtype = torch.float64 if input.dtype == torch.float64 else torch.float32
+  return torch.linalg.inv_ex(input.to(dtype))[0].to(input.dtype)
+try:
+  import kornia.geometry.transform.imgwarp as _kw
+  import kornia.geometry.conversions as _kc
+  _kw._torch_inverse_cast = _inv_nosync
+  _kc._torch_inverse_cast = _inv_nosync
+except Exception:  # noqa: BLE001
+  pass
