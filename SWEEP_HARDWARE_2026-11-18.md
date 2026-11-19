@@ -206,3 +206,37 @@ Takes are in `/home/tylerlum/kuan_takes/` (ws-16 local) and copied to `/juno/u/t
 - Multi-camera: same with ZED1 + ZED2 poses together; score = max visibility over cameras per frame.
 - Perception noise in the policy: inject the observed failure modes (brush pose snaps to the table near the cube for ~1 s;
   brush pose frozen on the robot link; cube invalid for 10-50 frames) and check the policy's response.
+
+## 8. FoundationPose++-style tracking (branch `2026-11-18_FoundationPosePlusPlus`, 18 Nov evening)
+
+Tracker: `live_tracking_robust_2_objects.py` (now also has the payload topics + capture stamps, so it can drive ws-19).
+Recommended flags on top of the usual ZED2 command (§4a), all object 1 = brush:
+```
+--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --save_depth
+--payload_object 2 --payload_config /home/tylerlum/kuan_takes/sweep_payload_fp_10mm.json --ros
+```
+What each does: SAM2 (tiny, real-time fork) tracks the brush's 2D mask at 640 px, GPU frame prep, on its own thread
+and CUDA stream, every 2nd frame. The lost check compares FoundationPose's silhouette with that mask by coverage
+(fraction of the mask inside the silhouette; IoU false-alarms under heavy hand occlusion). When lost for 4 frames:
+first re-anchor the last pose onto the mask and refine (keeps orientation), else re-register from the mask.
+`--save_depth` writes `<take>/replay/` so a real rollout can be re-run offline with `--replay_dir`.
+
+Evidence so far (SYNTHETIC sequences built from one real ZED1 frame; ground truth = image shift; labelled as such):
+
+| Sequence | Plain FoundationPose | Recommended flags | Original FoundationPose++ (Cutie, +KF) |
+|---|---|---|---|
+| brush teleports 150 px | lost for good: 228 mm median, 80/149 frames > 3 cm | recovers in 3 frames: 12 mm median, rot max 12.7 deg | translation 12-14 mm, rotation 65-74 deg median (flips to 180) |
+| 86% held occlusion + orange link | 4.6 mm median, 7.6 max | same (no regression) | not run |
+| pan up to 75 px/frame | 23 mm max | same | not run |
+
+Replay FPS on the 4090 with the GPU free (no camera/depth): plain 38, SAM2 check sync 22.5, async 28.3,
+async + every 2 = 32.5. Live adds ~7 ms/frame (capture + Fast-FS).
+
+Dropped (hurt on synthetic): blanking depth outside the mask (rotation error x2), constant-velocity start pose
+(100 deg flip), FoundationPose++'s per-frame centre anchor (mask centre != object centre under occlusion).
+Opt-in still available: `--fpp_anchor_xy` (silhouette delta gated on coverage), `--fpp_mask_depth_px`, `--fpp_filter`.
+
+Speed fixes: SAM2 prepare_data on the GPU (35 -> 21 ms), 640 px (-> 13 ms), nvdiffrast silhouette for the check
+(11.4 -> ~1-3 ms), check / anchor maths in a bounding box (12.5 -> 1.9 ms, 2.9 -> 0.9 ms).
+FoundationPose++ itself runs in a clone of the drl venv: `/home/tylerlum/github_repos/FoundationPose-plus-plus/.venv_fpp`
+(+ hydra-core, easydict, Cutie `--no-deps`; set PYTHONPATH to our FoundationPose so its compiled code is used).
