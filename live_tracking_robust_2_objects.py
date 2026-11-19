@@ -848,6 +848,8 @@ def _build_parser():
     parser.add_argument('--lost_anchor_accept', type=float, default=0.6)
     parser.add_argument('--lost_action', choices=['report', 'reregister'], default='reregister')
     parser.add_argument('--lost_cooldown_s', type=float, default=1.0)
+    parser.add_argument('--lost_max_cooldown_s', type=float, default=8.0,
+                        help='Fixes that keep failing double the cooldown up to this (re-registration blocks ~0.6 s).')
     parser.add_argument('--lost_mask_max_ratio', type=float, default=3.0,
                         help='Re-register from SAM2 only if its mask is <= this x the registration mask (not the hand).')
     # FoundationPose++-style aids (fpp_tracking.py, 18 Nov 2026); all need --sam2_tool, all default off.
@@ -1667,7 +1669,7 @@ def main():
                 if c['lost']:
                     robust_state['n_lost'] += 1
                 if (c['lost'] and args.lost_action == 'reregister'
-                        and now - robust_state['last_fix'] > args.lost_cooldown_s):
+                        and now - robust_state['last_fix'] > robust_state.get('cooldown', args.lost_cooldown_s)):
                     T = reseed_msg['T'] if now - reseed_msg['t'] < args.reseed_max_age_s else None
                     sam_ok = 0 < c['sam_px'] <= args.lost_mask_max_ratio * max(robust_state['mask0_px'], 1)
                     if T is not None and not (args.reseed_message_action == 'register' and sam_ok):
@@ -1688,6 +1690,13 @@ def main():
                                 row['action'] += '; reseed_node'
                     else:
                         row['action'] = 'skip: SAM2 mask too large'
+                    # Back off when fixes keep failing (lost again soon after the last fix): each re-registration
+                    # blocks the loop ~0.6 s, so a SAM2 mask on the wrong thing could otherwise stall tracking.
+                    if now - robust_state['last_fix'] < 3.0 * robust_state.get('cooldown', args.lost_cooldown_s):
+                        robust_state['cooldown'] = min(2.0 * robust_state.get('cooldown', args.lost_cooldown_s),
+                                                       args.lost_max_cooldown_s)
+                    else:
+                        robust_state['cooldown'] = args.lost_cooldown_s
                     robust_state['last_fix'] = now
                     robust_state['n_fix'] += 1
                     check.n_bad = 0

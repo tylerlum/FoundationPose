@@ -230,7 +230,10 @@ Evidence so far (SYNTHETIC sequences built from one real ZED1 frame; ground trut
 | pan up to 75 px/frame | 23 mm max | same | not run |
 
 Replay FPS on the 4090 with the GPU free (no camera/depth): plain 38, SAM2 check sync 22.5, async 28.3,
-async + every 2 = 32.5. Live adds ~7 ms/frame (capture + Fast-FS).
+async + every 2 = 32.5. Real camera (ZED1, text masks): plain 30.0, recommended 28.6-28.8 FPS, 0 LOST.
+Live ZED2 (v4, panel open): ~25 FPS (inst 17-33).
+Unattended registration: `--text_prompt "red brush" --text_prompt_2 "small yellow cube"` instead of
+`--mask_mode points` (SAM3 scores 0.70-0.86 and 0.95). Repeated failed fixes back off (cooldown x2 up to 8 s).
 
 Dropped (hurt on synthetic): blanking depth outside the mask (rotation error x2), constant-velocity start pose
 (100 deg flip), FoundationPose++'s per-frame centre anchor (mask centre != object centre under occlusion).
