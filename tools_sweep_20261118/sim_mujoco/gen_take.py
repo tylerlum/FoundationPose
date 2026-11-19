@@ -53,13 +53,15 @@ def scenario(name):
                 (3.6, at(R45, 0.05, -0.80, TT + 0.16), 0.8, True), (4.4, at(R45, -0.04, -0.86, TT + 0.12), 0.8, True),
                 (5.2, at(R_REST, -0.06, -0.86, TT + 0.16), 0.8, True), (6.0, at(R45, 0.02, -0.82, TT + 0.20), 0.8, True),
                 (7.0, at(R45, 0.02, -0.82, TT + 0.20), 0.8, True)]
-    if name.startswith('heldout_'):
+    if name.startswith('heldout_') or name.startswith('tour_'):
         # Held-out paths (not used for tuning): 7 random poses from the 40% most occluded + 3 random others,
         # random order by nearest neighbour, seed from the name (heldout_<seed>).
         import json as _json
         seed = int(name.split('_')[1])
         rs = np.random.RandomState(seed)
-        res = [r for r in _json.load(open(Path(__file__).resolve().parent / 'pose_search.json')) if r['slide'] == 0.02]
+        _pf = 'pose_search.json' if S.TASK == 'sweep' else f'pose_search_{S.TASK}.json'
+        res = [r for r in _json.load(open(Path(__file__).resolve().parent / _pf))
+               if S.TASK != 'sweep' or r['slide'] == 0.02]
         res.sort(key=lambda r: r['vis'])
         q = lambda r: np.array(r['q'])  # noqa: E731
         n40 = int(0.4 * len(res))
@@ -99,6 +101,56 @@ def scenario(name):
     raise ValueError(name)
 
 
+def _rz(th):
+    c, s_ = np.cos(th), np.sin(th)
+    return np.array([[c, -s_, 0], [s_, c, 0], [0, 0, 1.0]])
+
+
+def task_keys(name, model, data, arm_q, arm_d, T_bp, home):
+    """Keyframes for the screw / wrench tasks (tool-space poses), choosing a reachable start angle with IK."""
+    wp = np.array([*S.TASKS[S.TASK]['wp_xy'], TT + 0.001])
+    def reach(T):
+        best = 9.0
+        for seed in range(4):
+            data.qpos[arm_q] = home + (0 if seed == 0 else np.random.RandomState(seed).uniform(-0.8, 0.8, 7))
+            e = ik_palm(model, data, arm_q, arm_d, T @ T_bp, iters=250)
+            best = min(best, e[0] + e[1] / 100)
+        return best
+    if name == 'screw_task':
+        # tool x (handle -> tip) points down; the tip (x = +0.15) rests on the screw head (top ~16 mm up)
+        def pose(th, lift=0.0):
+            x = np.array([0, 0, -1.0]); y = _rz(th) @ np.array([1.0, 0, 0]); z = np.cross(x, y)
+            return T_of(np.stack([x, y, z], 1), wp + [0, 0, 0.016 + 0.15 + 0.002 + lift])
+        cands = sorted(((reach(pose(th)) + reach(pose(th + np.pi / 2)), th) for th in np.radians(np.arange(0, 360, 30))))
+        th0 = cands[0][1]
+        print(f'screw_task: start angle {np.degrees(th0):.0f} deg (IK err {cands[0][0]:.3f})')
+        ks = [(0.0, pose(th0, 0.10), 0.8, True), (1.0, pose(th0, 0.0), 0.8, True)]
+        t = 1.0
+        for k in range(3):            # three turns of 90 deg and back (screwing with the wrist)
+            t += 1.2; ks.append((t, pose(th0 + np.pi / 2, 0.0), 0.8, True))
+            t += 1.2; ks.append((t, pose(th0, 0.0), 0.8, True))
+        ks += [(t + 1.0, pose(th0, 0.10), 0.8, True), (t + 2.0, pose(th0, 0.10), 0.8, True)]
+        return ks
+    if name == 'wrench_task':
+        # wrench flat (tool z up), jaws (x ~ +0.105) around the bolt head; swing +-40 deg about the bolt axis
+        def pose(ph, lift=0.0):
+            x = _rz(ph) @ np.array([1.0, 0, 0]); z = np.array([0, 0, 1.0]); y = np.cross(z, x)
+            return T_of(np.stack([x, y, z], 1), wp + [0, 0, 0.006 + lift] - 0.105 * x)
+        cands = sorted(((reach(pose(ph - np.radians(40))) + reach(pose(ph + np.radians(40))), ph)
+                        for ph in np.radians(np.arange(0, 360, 30))))
+        ph0 = cands[0][1]
+        print(f'wrench_task: centre angle {np.degrees(ph0):.0f} deg (IK err {cands[0][0]:.3f})')
+        a = np.radians(40)
+        ks = [(0.0, pose(ph0, 0.08), 0.8, True), (1.0, pose(ph0, 0.0), 0.8, True)]
+        t = 1.0
+        for k in range(3):
+            t += 1.3; ks.append((t, pose(ph0 + a), 0.8, True))
+            t += 1.3; ks.append((t, pose(ph0 - a), 0.8, True))
+        ks += [(t + 1.0, pose(ph0, 0.0), 0.8, True), (t + 2.0, pose(ph0, 0.08), 0.8, True), (t + 3.0, pose(ph0, 0.08), 0.8, True)]
+        return ks
+    raise ValueError(name)
+
+
 def interp(keys, t):
     """Min-jerk position + slerp rotation between keyframes; curl linear in the same phase; attached from the later key."""
     ts = [k[0] for k in keys]
@@ -110,6 +162,7 @@ def interp(keys, t):
     (t0, A, c0, a0), (t1, B, c1, a1) = keys[i], keys[i + 1]
     s = (t - t0) / (t1 - t0)
     s = 10 * s ** 3 - 15 * s ** 4 + 6 * s ** 5
+    s = min(max(s, 0.0), 1.0)          # the polynomial can overshoot 1 by an ulp
     if np.ndim(A) == 1:  # joint-space keyframe (7 arm angles)
         T = (1 - s) * A + s * B
     else:
@@ -173,7 +226,7 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--fps', type=float, default=30.0)
     ap.add_argument('--roll', type=float, default=270.0, help='brush roll in the grasp (deg)')
-    ap.add_argument('--slide', type=float, default=0.02)
+    ap.add_argument('--slide', type=float, default=None, help='default: 0.02 for the brush, 0 (handle centre) otherwise')
     ap.add_argument('--curl', type=float, default=0.8)
     ap.add_argument('--vmax', type=float, default=0.9, help='peak brush speed m/s (real takes: p95 0.5-0.9)')
     ap.add_argument('--wmax', type=float, default=350.0, help='peak brush turn rate deg/s (real: p95 ~300)')
@@ -182,6 +235,8 @@ def main():
                          'take: replay/hand_T.npy (palm, robot frame), replay/hand_center.npy (grasp centre = mean of '
                          'the four fingers PP+MP bodies) and check the brush poses match gt/T_world_brush.npy.')
     a = ap.parse_args()
+    if a.slide is None:
+        a.slide = 0.02 if S.TASK == 'sweep' else 0.0
     out = Path(a.out)
     rd = out / 'replay'
     for sub in (() if a.hand_only else ('rgb', 'right', 'depth_gt', 'masks_1', 'masks_2')):
@@ -200,7 +255,8 @@ def main():
     T_pb = S.grasp_T_auto(model, data, a.roll, slide=a.slide)
     T_bp = np.linalg.inv(T_pb)
 
-    keys = scenario(a.scenario)
+    keys = (task_keys(a.scenario, model, data, arm_q, arm_d, T_bp, home) if a.scenario in ('screw_task', 'wrench_task')
+            else scenario(a.scenario))
     keys = retime(keys, model, data, arm_q, T_pb, a.vmax, a.wmax)
     data.qpos[arm_q] = home
     mujoco.mj_kinematics(model, data)
@@ -215,8 +271,9 @@ def main():
     opt_brush = mujoco.MjvOption()
     opt_brush.geomgroup[:] = 0
     opt_brush.geomgroup[2] = 1
-    model.geom_group[model.geom('brush_geom').id] = 2
-    gid_b, gid_c = model.geom('brush_geom').id, model.geom('cube_geom').id
+    gids_b = np.array([g for g in range(model.ngeom) if model.geom(g).name.startswith('brush_geom')])
+    gids_c = np.array([g for g in range(model.ngeom) if model.geom(g).name.startswith('cube_geom')])
+    model.geom_group[gids_b] = 2
     Tinv = np.linalg.inv(T_RC)
     cam_brush, cam_cube, w_brush, w_cube, vis, pxs, att, ik_err = [], [], [], [], [], [], [], []
     if not a.hand_only:
@@ -296,9 +353,9 @@ def main():
         seg_b = ren.render().copy()
         ren.disable_segmentation_rendering()
         is_geom = seg[..., 1] == mujoco.mjtObj.mjOBJ_GEOM
-        mb = is_geom & (seg[..., 0] == gid_b)
-        mc = is_geom & (seg[..., 0] == gid_c)
-        full_b = (seg_b[..., 1] == mujoco.mjtObj.mjOBJ_GEOM) & (seg_b[..., 0] == gid_b)
+        mb = is_geom & np.isin(seg[..., 0], gids_b)
+        mc = is_geom & np.isin(seg[..., 0], gids_c)
+        full_b = (seg_b[..., 1] == mujoco.mjtObj.mjOBJ_GEOM) & np.isin(seg_b[..., 0], gids_b)
         stem = f'{i:05d}'
         imageio.imwrite(rd / 'rgb' / f'{stem}.png', rgb)
         imageio.imwrite(rd / 'right' / f'{stem}.png', right)
@@ -336,6 +393,7 @@ def main():
                      vis_brush=vis, px_brush=pxs, attached=att, ik_err=ik_err).items():
         np.save(out / 'gt' / f'{k}.npy', np.asarray(v))
     np.savetxt(out / 'gt' / 'T_RC.txt', T_RC)
+    (out / 'gt' / 'task.txt').write_text(S.TASK + '\n')
     json.dump(dict(scenario=a.scenario, fps=a.fps, n=n, roll=a.roll, slide=a.slide, curl=a.curl,
                    max_ik_mm=float(np.max([e[0] for e in ik_err]) * 1000),
                    max_ik_deg=float(np.max([e[1] for e in ik_err]))), open(out / 'gt' / 'info.json', 'w'), indent=1)

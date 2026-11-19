@@ -985,6 +985,11 @@ def _build_parser():
                         help='PoseStamped (robot frame) to restart FoundationPose from when lost, e.g. '
                              '/robot_frame/tool_pose_node (the node with --tool_hand_hold_s). Needs --calibration.')
     parser.add_argument('--reseed_max_age_s', type=float, default=0.2)
+    parser.add_argument('--reseed_file', type=str, default=None,
+                        help='(19 Nov, replay) the other camera\'s object-1 poses as an .npz (stamps ns, T_robot Nx4x4; '
+                             'tools_sweep_20261118/sim_mujoco/export_robot_poses.py). Used like --reseed_topic: when '
+                             'lost, restart from the other camera\'s pose of the same instant (skipped if the tool is '
+                             'held and that pose is far from the hand). Needs --calibration.')
     parser.add_argument('--reseed_on_message', action='store_true',
                         help='(29 Oct, the two-camera hand-off) restart FoundationPose from EVERY new message on '
                              '--reseed_topic (deployment/fp_kit/tool_camera_selector.py sends one when this '
@@ -1628,6 +1633,14 @@ def main():
                 _rospy_q.Subscriber(args.reseed_topic, _PS, _reseed_cb, queue_size=1)
                 print(f'[robust] restart FoundationPose from {args.reseed_topic} when lost', flush=True)
 
+        _rsf = None
+        if args.reseed_file:
+            _z = np.load(args.reseed_file)
+            _rsf = dict(stamps=np.asarray(_z['stamps'], np.int64), T=np.asarray(_z['T_robot'], np.float64),
+                        T_CR=np.linalg.inv(np.asarray(T_up, np.float64)))
+            print(f'[robust] restart from the other camera\'s poses in {args.reseed_file} when lost '
+                  f'({len(_rsf["stamps"])} poses)', flush=True)
+
         fpp_on = args.fpp_anchor_xy or args.fpp_mask_depth_px >= 0 or args.fpp_filter
         if fpp_on and sam is None:
             raise SystemExit('--fpp_anchor_xy / --fpp_mask_depth_px / --fpp_filter need --sam2_tool (SAM2 gives the mask)')
@@ -1900,6 +1913,10 @@ def main():
             robust_state['frame'] += 1
             row = dict(t=time.time(), sam_ms=0.0, action='')
             now = time.time()
+            if _rsf is not None and o.ts_ns is not None:
+                j = int(np.searchsorted(_rsf['stamps'], int(o.ts_ns), side='right')) - 1
+                if j >= 0 and int(o.ts_ns) - _rsf['stamps'][j] < 1.5e8 and np.isfinite(_rsf['T'][j]).all():
+                    reseed_msg['T'], reseed_msg['t'] = _rsf['T_CR'] @ _rsf['T'][j], now
             if (args.reseed_on_message and reseed_msg['T'] is not None
                     and reseed_msg['t'] > robust_state.get('reseed_t', 0.0)
                     and now - reseed_msg['t'] < args.reseed_max_age_s):
@@ -2065,6 +2082,11 @@ def main():
                 if (c['lost'] and args.lost_action == 'reregister'
                         and now - robust_state['last_fix'] > robust_state.get('cooldown', args.lost_cooldown_s)):
                     T = reseed_msg['T'] if now - reseed_msg['t'] < args.reseed_max_age_s else None
+                    if T is not None and args.hand_check != 'off' and _hand['held']:
+                        _hc = _hand_center()
+                        if _hc is not None and _hand_dist(T, _hc) > args.hand_max_dist:
+                            T = None                  # the other camera's pose is not at the hand either
+                            row['seed_skip'] = 'far from hand'
                     sam_ok = 0 < c['sam_px'] <= args.lost_mask_max_ratio * max(robust_state['mask0_px'], 1)
                     if not sam_ok and args.lost_text_redetect and T is None:
                         # SAM2's mask is empty or far too large: ask SAM3 text for a fresh one (~0.3 s)
@@ -2088,6 +2110,8 @@ def main():
                     if T is not None and not (args.reseed_message_action == 'register' and sam_ok):
                         _set_state(o, T)
                         row['action'] = 'reseed_node'
+                        robust_state['catchup'] = True
+                        _hand['n_far'] = 0
                     elif sam_ok and args.lost_try_anchor and _try_anchor(o, rgb, depth, mask):
                         row['action'] = 'anchor_sam2'
                         robust_state['catchup'] = True

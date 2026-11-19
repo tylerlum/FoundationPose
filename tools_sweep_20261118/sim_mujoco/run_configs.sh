@@ -37,13 +37,23 @@ declare -A CFG=(
   [plainb]=""
   [v4hct]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2 --lost_text_redetect --redetect_prompt red_brush"
   [v4hctb]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2 --lost_text_redetect --redetect_prompt red_brush"
+  [v4hcx]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2 @RSF@"
+  [v4hcxb]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2 @RSF@"
   [v4_sync]="--sam2_tool --sam2_image_size 640 --sam2_every 2 --lost_metric cover --lost_try_anchor"
 )
 suffix=""; [ "$RP" = replay_gtdepth ] && suffix=_gt; [ -n "$RT" ] && [ "$RT" != "0" ] && suffix="${suffix}_rt"
 for name in $CFGS; do
   out=$S/runs/$TAKE$suffix/$name; rm -rf "$out"; mkdir -p "$out"
+  # meshes per task (the tracker flags are the same for every task)
+  TASKN=$(cat $R/takes/$TAKE/gt/task.txt 2>/dev/null || echo sweep)
+  KM=/juno/u/tylerlum/kit_tracking_meshes_20261013
+  case $TASKN in
+    screw)  M1=$KM/screwdriver_fin_quad_print/round_screwdriver_p1_fin_quad.obj; M2=$KM/screw_p1_head_bluegrey.obj; N2=screw_head; U2=screw_p1_head_bluegrey ;;
+    wrench) M1=$KM/open_wrench_18_red.obj; M2=$KM/bolt_thick_head_bluegrey.obj; N2=bolt_head; U2=bolt_thick_head_bluegrey ;;
+    *)      M1=$M/red_brush/red_brush.obj; M2=$M/cube_29mm_gold.obj; N2=cube_29mm; U2=cube_29mm_gold ;;
+  esac
   cd $FP && $PY live_tracking_robust_2_objects.py --replay_dir "$S/takes/$TAKE/$RP" --replay_realtime_scale ${RT:-0} --mask_mode replay \
-    --headless --no_auto_record --mesh_path $M/red_brush/red_brush.obj --mesh_path_2 $M/cube_29mm_gold.obj \
-    --object_name_2 cube_29mm --upright_meshes cube_29mm_gold --save_dir "$out" $(echo "${CFG[$name]}" | sed "s|@CAL@|--calibration $R/takes/$TAKE/gt/T_RC.txt|") $EXTRA > "$out/log.txt" 2>&1
+    --headless --no_auto_record --mesh_path $M1 --mesh_path_2 $M2 \
+    --object_name_2 $N2 --upright_meshes $U2 --save_dir "$out" $(echo "${CFG[$name]}" | sed "s|@CAL@|--calibration $R/takes/$TAKE/gt/T_RC.txt|; s|@RSF@|--reseed_file $R/rsf/$TAKE.npz|") $EXTRA > "$out/log.txt" 2>&1
   echo "$TAKE$suffix $name exit $?"
 done

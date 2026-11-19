@@ -8,6 +8,7 @@ The brush is a free body in hand-held mode: each frame its pose is set from the 
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -21,7 +22,7 @@ from realworld.mujoco_rollout.stir_mujoco_sim import IIWA14_XML, SHARPA_XML, TRA
 from realworld.mujoco_rollout.robot_visuals import apply_training_robot_visuals  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-ASSETS = Path(os.environ.get('FPSIM_MESH_DIR', '/juno/u/tylerlum/tracking_meshes_20261026/red_brush'))  # red_brush.obj + material_0.png
+ASSETS = Path(os.environ.get('FPSIM_MESH_DIR', '/juno/u/tylerlum/tracking_meshes_20261026/red_brush'))
 # Camera (env FPSIM_CAM): the calibrated poses compared on 19 Nov; K at 960x540.
 CAMS = {
     'zed2_172707': ('/juno/u/tylerlum/camera_2_calibration_27432424/record_visual_20261118_172707/T_RC.txt',
@@ -32,6 +33,26 @@ CAMS = {
              (692.022, 692.022, 480.106, 282.767)),           # ZED1, left side
 }
 CAM = os.environ.get('FPSIM_CAM', 'zed2_172707')
+# Task (env FPSIM_TASK): which tool is held and which workpiece sits on the table.
+#   sweep : red brush (textured scan) + 29 mm gold cube (free, physics)
+#   screw : 4-colour fin screwdriver (round_screwdriver_p1_fin_quad) + screw head (fixed)
+#   wrench: open wrench 18 (red) + thick bolt head (fixed)
+KIT = HERE / 'assets_kit'
+TASK = os.environ.get('FPSIM_TASK', 'sweep')
+TASKS = {
+    'sweep': dict(tool=None, wp=None,
+                  meshes=('/juno/u/tylerlum/tracking_meshes_20261026/red_brush/red_brush.obj',
+                          '/juno/u/tylerlum/tracking_meshes_20261026/cube_29mm_gold.obj'), names=('red_brush', 'cube_29mm'),
+                  prompt='red brush'),
+    'screw': dict(tool='round_screwdriver_p1_fin_quad', wp='screw_p1_head_bluegrey', wp_xy=(0.02, -0.82),
+                  meshes=('/juno/u/tylerlum/kit_tracking_meshes_20261013/screwdriver_fin_quad_print/round_screwdriver_p1_fin_quad.obj',
+                          '/juno/u/tylerlum/kit_tracking_meshes_20261013/screw_p1_head_bluegrey.obj'),
+                  names=('screwdriver', 'screw_head'), prompt='screwdriver'),
+    'wrench': dict(tool='open_wrench_18_red', wp='bolt_thick_head_bluegrey', wp_xy=(0.02, -0.82),
+                   meshes=('/juno/u/tylerlum/kit_tracking_meshes_20261013/open_wrench_18_red.obj',
+                           '/juno/u/tylerlum/kit_tracking_meshes_20261013/bolt_thick_head_bluegrey.obj'),
+                   names=('wrench', 'bolt_head'), prompt='red wrench'),
+}
 TRC = CAMS[CAM][0]
 _fx, _fy, _cx, _cy = CAMS[CAM][1]
 K960 = np.array([[_fx, 0, _cx], [0, _fy, _cy], [0, 0, 1.0]])
@@ -95,20 +116,35 @@ def build(T_RC=None, cube_xy=(0.10, -0.90), robot_visuals='training'):
     tb.add_geom(name='table_geom', type=mujoco.mjtGeom.mjGEOM_BOX, size=np.array(TABLE_SIZE) / 2, material='cloth_mat',
                 friction=[0.8, 0.02, 0.001])
 
-    # brush: textured visual mesh at the mesh's own frame (body frame == mesh frame == FoundationPose object frame)
-    spec.add_texture(name='brush_tex', type=mujoco.mjtTexture.mjTEXTURE_2D, file=str(ASSETS / 'material_0.png'))
-    bm = spec.add_material(name='brush_mat')
-    bm.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = 'brush_tex'
-    spec.add_mesh(name='brush_mesh', file=str(ASSETS / 'red_brush.obj'))
-    bb = wb.add_body(name='brush', pos=[0.3, -0.8, TABLE_TOP + 0.02])
+    # The held tool is body 'brush' and the workpiece body 'cube' for every task (geoms 'brush_geom*' / 'cube_geom*'),
+    # each at its mesh's own frame (body frame == mesh frame == FoundationPose object frame).
+    tk = TASKS[TASK]
+    bb = wb.add_body(name='brush', pos=[0.3, -0.8, TABLE_TOP + 0.05])
     bb.add_freejoint(name='brush_free')
-    bb.add_geom(name='brush_geom', type=mujoco.mjtGeom.mjGEOM_MESH, meshname='brush_mesh', material='brush_mat',
-                contype=0, conaffinity=0, mass=0.08)
-    # cube: physical box, gold
-    cb = wb.add_body(name='cube', pos=[*cube_xy, TABLE_TOP + CUBE_HALF + 1e-3])
-    cb.add_freejoint(name='cube_free')
-    cb.add_geom(name='cube_geom', type=mujoco.mjtGeom.mjGEOM_BOX, size=[CUBE_HALF] * 3, rgba=[0.85, 0.66, 0.18, 1],
-                mass=0.03, friction=[0.8, 0.02, 0.001])
+    if tk['tool'] is None:
+        spec.add_texture(name='brush_tex', type=mujoco.mjtTexture.mjTEXTURE_2D, file=str(ASSETS / 'material_0.png'))
+        bm = spec.add_material(name='brush_mat')
+        bm.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = 'brush_tex'
+        spec.add_mesh(name='brush_mesh', file=str(ASSETS / 'red_brush.obj'))
+        bb.add_geom(name='brush_geom', type=mujoco.mjtGeom.mjGEOM_MESH, meshname='brush_mesh', material='brush_mat',
+                    contype=0, conaffinity=0, mass=0.08)
+    else:
+        for k, (f, rgba) in enumerate(json.load(open(KIT / tk['tool'] / 'parts.json'))):
+            spec.add_mesh(name=f'brush_mesh_{k}', file=str(KIT / tk['tool'] / os.path.basename(f)))
+            bb.add_geom(name=f'brush_geom_{k}', type=mujoco.mjtGeom.mjGEOM_MESH, meshname=f'brush_mesh_{k}', rgba=rgba,
+                        contype=0, conaffinity=0, mass=0.02)
+    if tk['wp'] is None:
+        # cube: physical box, gold
+        cb = wb.add_body(name='cube', pos=[*cube_xy, TABLE_TOP + CUBE_HALF + 1e-3])
+        cb.add_freejoint(name='cube_free')
+        cb.add_geom(name='cube_geom', type=mujoco.mjtGeom.mjGEOM_BOX, size=[CUBE_HALF] * 3, rgba=[0.85, 0.66, 0.18, 1],
+                    mass=0.03, friction=[0.8, 0.02, 0.001])
+    else:
+        # fixed workpiece (column frame: origin on the turning axis, 1 mm above the table, +z up)
+        cb = wb.add_body(name='cube', pos=[*tk['wp_xy'], TABLE_TOP + 0.001])
+        for k, (f, rgba) in enumerate(json.load(open(KIT / tk['wp'] / 'parts.json'))):
+            spec.add_mesh(name=f'cube_mesh_{k}', file=str(KIT / tk['wp'] / os.path.basename(f)))
+            cb.add_geom(name=f'cube_geom_{k}', type=mujoco.mjtGeom.mjGEOM_MESH, meshname=f'cube_mesh_{k}', rgba=rgba)
 
     for name, off in (('zed_left', 0.0), ('zed_right', BASELINE)):
         cam = wb.add_camera(name=name)

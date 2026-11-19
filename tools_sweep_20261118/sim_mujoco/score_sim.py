@@ -14,10 +14,20 @@ import trimesh
 from scipy.spatial.transform import Rotation as R
 
 M = '/juno/u/tylerlum/tracking_meshes_20261026'
-PTS = {1: trimesh.load(f'{M}/red_brush/red_brush.obj', force='mesh', process=False).sample(2000, seed=0)
-       if hasattr(trimesh.Trimesh, 'sample') else None,
-       2: trimesh.load(f'{M}/cube_29mm_gold.obj', force='mesh', process=False).vertices}
-PTS[1] = trimesh.load(f'{M}/red_brush/red_brush.obj', force='mesh', process=False).vertices[::5]
+KM = '/juno/u/tylerlum/kit_tracking_meshes_20261013'
+MESHES = {'sweep': (f'{M}/red_brush/red_brush.obj', f'{M}/cube_29mm_gold.obj'),
+          'screw': (f'{KM}/screwdriver_fin_quad_print/round_screwdriver_p1_fin_quad.obj', f'{KM}/screw_p1_head_bluegrey.obj'),
+          'wrench': (f'{KM}/open_wrench_18_red.obj', f'{KM}/bolt_thick_head_bluegrey.obj')}
+_PTS = {}
+
+
+def pts_for(take, k):
+    task = open(f'{take}/gt/task.txt').read().strip() if Path(f'{take}/gt/task.txt').exists() else 'sweep'
+    if (task, k) not in _PTS:
+        v = np.asarray(trimesh.load(MESHES[task][k - 1], force='mesh', process=False).vertices)
+        step = (5 if k == 1 else 1) if task == 'sweep' else max(1, len(v) // 2400)   # sweep: same points as before
+        _PTS[(task, k)] = v[::step]
+    return _PTS[(task, k)]
 
 
 def add(Ta, Tb, pts):
@@ -64,7 +74,7 @@ def score(take, run):
                 e_add.append(np.inf); e_t.append(np.inf); e_r.append(np.inf); v.append(vis[gi])
                 continue
             G = gt[k][gi]
-            e_add.append(add(T, G, PTS[k]))
+            e_add.append(add(T, G, pts_for(take, k)))
             e_t.append(np.linalg.norm(T[:3, 3] - G[:3, 3]))
             ang = np.degrees(R.from_matrix(G[:3, :3].T @ T[:3, :3]).magnitude())
             if k == 2:  # cube: 24-fold symmetry -> smallest angle to a cube rotation
