@@ -881,6 +881,11 @@ def _build_parser():
     parser.add_argument('--sam2_simple_prompt', action='store_true',
                         help='Prompt SAM2 with box + 1 point (before 19 Nov). Default: box + 4 positive points + 6 '
                              'negative points around the mask, which stops SAM2 taking the hand and arm.')
+    parser.add_argument('--log_checks', action='store_true',
+                        help='(19 Nov) Log, every --color_every frames, object 1\'s mesh-colour error (ce), depth fit '
+                             '(fit), visible pixels (n_vis) and learned-appearance distance (app: HSV histogram vs the '
+                             'first frames after registration) into robust_log.json. Logging only (~3-6 ms on those '
+                             'frames); use with --save_depth to tune thresholds offline.')
     parser.add_argument('--bleed_ratio', type=float, default=1.5)
     parser.add_argument('--color_good', type=float, default=0.15,
                         help='--arbitrate color: the pose is trusted when its rendered colours differ from the image by '
@@ -932,6 +937,10 @@ def _build_parser():
     parser.add_argument('--fpp_mask_depth_px', type=int, default=-1,
                         help='>= 0: track object 1 on depth blanked outside SAM2\'s mask dilated by this many px, so '
                              'FoundationPose cannot slide onto the hand / arm / table. -1 = off.')
+    parser.add_argument('--fpp_filter_alpha', type=float, default=0.5,
+                        help='Velocity low-pass for --fpp_filter (19 Nov sim: 0.5 at 30 Hz, 0.8 when frames skip).')
+    parser.add_argument('--fpp_filter_max_v', type=float, default=0.05, help='m per frame cap.')
+    parser.add_argument('--fpp_filter_max_w', type=float, default=20.0, help='deg per frame cap.')
     parser.add_argument('--fpp_filter', action='store_true',
                         help='Start object 1\'s track_one from a constant-velocity prediction of its last poses.')
     parser.add_argument('--fpp_min_mask_px', type=int, default=60,
@@ -1578,7 +1587,8 @@ def main():
             print(f'[fpp] object 1: anchor_xy={args.fpp_anchor_xy} ({args.fpp_anchor_mode}, max '
                   f'{args.fpp_max_shift_px:g} px), mask_depth_px={args.fpp_mask_depth_px}, filter={args.fpp_filter}; '
                   f'on SAM2 frames (every {max(args.sam2_every, 1)})', flush=True)
-        pose_filter = fpp_tracking.PoseFilter() if args.fpp_filter else None
+        pose_filter = (fpp_tracking.PoseFilter(args.fpp_filter_alpha, args.fpp_filter_max_v,
+                                               np.radians(args.fpp_filter_max_w)) if args.fpp_filter else None)
         fpp_mask = dict(m=None, ms=0.0, pose=None)  # SAM2 mask made before track_one this frame; _robust_step reuses it
         robust_state['prev_pose'] = None             # --sam2_async: object 1's pose on the frame the mask comes from
 
@@ -1609,11 +1619,6 @@ def main():
             if not (args.fpp_min_mask_px <= n <= args.lost_mask_max_ratio * max(robust_state['mask0_px'], 1)):
                 return depth, row
             row['fpp_used'] = True
-            if pose_filter is not None:
-                P = pose_filter.predict()
-                if P is not None:
-                    o.est.pose_last = torch.as_tensor(P, device=o.est.pose_last.device,
-                                                      dtype=o.est.pose_last.dtype).reshape(o.est.pose_last.shape)
             if args.fpp_anchor_xy and args.fpp_anchor_mode == 'centre':
                 o.est.pose_last, row['fpp_shift_px'] = fpp_tracking.anchor_xy(
                     o.est.pose_last, K, fpp_tracking.mask_centre(m), args.fpp_max_shift_px)
@@ -1793,6 +1798,18 @@ def main():
                         _set_state(o, Tf)
                         row['action'] = f'tag_fix (roll {rd:+.0f} deg, end {dp * 100:.1f} cm)'
                         robust_state['n_tag_fix'] += 1
+            if args.log_checks and o.pose is not None and robust_state['frame'] % max(args.color_every, 1) == 0:
+                ck = check.checks(rgb, depth, o.pose, args.fit_tol)
+                row.update(log_ce=ck['ce'], log_fit=ck['fit'], log_nvis=ck['n_vis'])
+                if ck['vis'] is not None and ck['n_vis'] >= 400:
+                    h = robust_tool.appearance_hist(rgb, ck['vis'])
+                    if robust_state.get('app_ref') is None or robust_state.get('app_ref_n', 0) < 5:
+                        # reference = mean of the first 5 checked frames after (re)start (pose assumed good there)
+                        n0 = robust_state.get('app_ref_n', 0)
+                        r0 = robust_state.get('app_ref')
+                        robust_state['app_ref'] = h if r0 is None else (r0 * n0 + h) / (n0 + 1)
+                        robust_state['app_ref_n'] = n0 + 1
+                    row['log_app'] = robust_tool.appearance_dist(h, robust_state['app_ref'])
             c = dict(badness=0.0, lost=False, iou=float('nan'), dpx=float('nan'))
             if sam is not None:
                 pose_m = None
@@ -2141,6 +2158,12 @@ def main():
                             continue        # keep (and publish again) its last pose
                         last_track_2 = t0
                     _depth_o, _fpp_row = depth, None
+                    if pose_filter is not None and o.k == 0:
+                        # constant-velocity start pose, every frame (19 Nov; was only on usable SAM2 frames)
+                        _P = pose_filter.predict()
+                        if _P is not None:
+                            o.est.pose_last = torch.as_tensor(_P, device=o.est.pose_last.device,
+                                                              dtype=o.est.pose_last.dtype).reshape(o.est.pose_last.shape)
                     if fpp_on and o.k == 0:
                         _depth_o, _fpp_row = _fpp_pre(o, rgb, depth)
                     o.pose = o.est.track_one(rgb=rgb, depth=_depth_o, K=K,
@@ -2156,6 +2179,8 @@ def main():
                             _ax, _sc = _flip_check(o, rgb, depth)
                             _flip_row = dict(flip=_ax, flip_scores=[round(float(x), 3) for x in _sc])
                             if _ax:
+                                if pose_filter is not None:
+                                    pose_filter.reset()
                                 robust_state['n_flip'] = robust_state.get('n_flip', 0) + 1
                                 print(f'\n[flip] object 1 turned 180 deg about mesh {_ax} (scores {np.round(_sc, 2)})',
                                       flush=True)

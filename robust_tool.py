@@ -66,6 +66,23 @@ def mask_prompt_rich(mask, n_pos=4, n_neg=6, ring=(12, 30)):
     return box, pts, lab
 
 
+def appearance_hist(rgb, mask):
+    """(19 Nov) Hue x saturation histogram (18 x 8) + one bin for dark pixels (V < 60: black bristles / handle) of
+    the pixels in mask, normalised. Learned from the real object, so the mesh texture does not matter."""
+    m = np.asarray(mask).astype(bool)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    dark = (hsv[..., 2] < 60) & m
+    h = cv2.calcHist([hsv], [0, 1], (m & ~dark).astype(np.uint8), [18, 8], [0, 180, 0, 256]).ravel()
+    h = np.append(h, float(dark.sum()))
+    return h / max(h.sum(), 1.0)
+
+
+def appearance_dist(h, ref):
+    """Bhattacharyya-style distance between two appearance_hist()s: 0 identical .. 1 disjoint. Real takes, brush on
+    the table (no occlusion test): 0.00-0.15; brush pose stuck on the orange KUKA link: 0.55-0.79."""
+    return float(np.sqrt(max(0.0, 1.0 - float(np.sum(np.sqrt(h * ref))))))
+
+
 RICH_PROMPT = True   # set False to get the old box + 1 point prompt
 
 
@@ -284,6 +301,31 @@ class ToolCheck:
         diff = (col[0].clamp(0, 1) - obs).abs().mean(-1)
         good = vis & (diff < 0.25)
         return float(diff[vis].mean()), n, good.cpu().numpy()
+
+    def checks(self, rgb, depth, T, tol=0.015):
+        """All per-frame consistency numbers from ONE render (19 Nov, for --log_checks): mesh-colour error, depth
+        fit, and the visible (drawn, not covered by a nearer surface) mask for appearance_dist()."""
+        out = dict(ce=float('nan'), fit=float('nan'), n_vis=0, vis=None)
+        if self.glctx is None or T is None or not np.isfinite(T).all() or T[2, 3] <= 0.01:
+            return out
+        import torch
+        from Utils import nvdiffrast_render
+        Tt = torch.as_tensor(np.asarray(T, np.float32)[None], device='cuda')
+        col, dep, _ = nvdiffrast_render(K=self.K, H=self.H, W=self.W, ob_in_cams=Tt, glctx=self.glctx,
+                                        mesh_tensors=self._mt)
+        d = torch.as_tensor(depth, device='cuda', dtype=torch.float32)
+        drawn = dep[0] > 0
+        ok = drawn & (d > 0.05)
+        vis = ok & (d >= dep[0] - tol)
+        n = int(vis.sum())
+        out['n_vis'] = n
+        if n >= 200:
+            obs = torch.as_tensor(rgb, device='cuda', dtype=torch.float32) / 255.0
+            out['ce'] = float((col[0].clamp(0, 1) - obs).abs().mean(-1)[vis].mean())
+            out['fit'] = float(((d - dep[0]).abs() <= tol)[vis].float().mean())
+            out['vis'] = vis.cpu().numpy()
+        return out
+
 
     def silhouette_cpu(self, T):
         m = np.zeros((self.H, self.W), np.uint8)

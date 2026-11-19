@@ -1,6 +1,6 @@
 #!/bin/bash
 # bash run_configs.sh TAKE_NAME [replay|replay_gtdepth] [config ...]   -> runs/<take>[_gt]/<config>/<take dir>
-S=$(cd "$(dirname "$0")" && pwd); R=${FPSIM_ROOT:-$S}  # R holds takes/ and runs/
+S=$(cd "$(dirname "$0")" && pwd); R=${FPSIM_ROOT:-$S}
 FP=/home/tylerlum/github_repos/depthbasedRL/third_party/FoundationPose
 PY=/home/tylerlum/github_repos/depthbasedRL/.venv/bin/python
 M=/juno/u/tylerlum/tracking_meshes_20261026
@@ -14,6 +14,8 @@ declare -A CFG=(
   [v7]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --arbitrate color --flip_check_every 3"
   [v8]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --arbitrate color --flip_check_every 3 --lost_max_cooldown_s 2"
   [v8b]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --arbitrate color --flip_check_every 3 --lost_max_cooldown_s 2"
+  [v8kf]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --arbitrate color --flip_check_every 3 --lost_max_cooldown_s 2 --fpp_filter --fpp_filter_alpha 0.8"
+  [v8kfb]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --arbitrate color --flip_check_every 3 --lost_max_cooldown_s 2 --fpp_filter --fpp_filter_alpha 0.8"
   [v4_sync]="--sam2_tool --sam2_image_size 640 --sam2_every 2 --lost_metric cover --lost_try_anchor"
 )
 suffix=""; [ "$RP" = replay_gtdepth ] && suffix=_gt; [ -n "$RT" ] && suffix="${suffix}_rt"
