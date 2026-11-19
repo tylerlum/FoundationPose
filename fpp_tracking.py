@@ -46,6 +46,43 @@ def anchor_xy(pose_last, K, uv, max_shift_px=None):
     return P, shift
 
 
+def silhouette_delta(mask, sil, dilate_px=15):
+    """Pixel shift (du, dv) that moves FoundationPose's silhouette onto SAM2's mask, comparing like with like: the
+    mask is only the VISIBLE part of the tool (the hand covers the rest), so compare its centre with the centre of the
+    part of the silhouette that falls inside the (dilated) mask; if that overlap is empty (FoundationPose drifted off),
+    fall back to the whole silhouette. Returns (du, dv, iou) or None if either is empty. Works in the padded bounding
+    box of mask | sil (full-frame bool ops cost several ms)."""
+    if not mask.any() or not sil.any():
+        return None
+    both = mask | sil
+    rows, cols = np.nonzero(both.any(1))[0], np.nonzero(both.any(0))[0]
+    H, W = mask.shape
+    y0, y1 = max(rows[0] - dilate_px, 0), min(rows[-1] + dilate_px + 1, H)
+    x0, x1 = max(cols[0] - dilate_px, 0), min(cols[-1] + dilate_px + 1, W)
+    m, sl = mask[y0:y1, x0:x1], sil[y0:y1, x0:x1]
+    inter, union = int((m & sl).sum()), int((m | sl).sum())
+    iou = inter / union if union else 0.0
+    near = cv2.dilate(m.astype(np.uint8), np.ones((2 * dilate_px + 1,) * 2, np.uint8)) > 0
+    part = sl & near
+    ref = part if part.sum() >= 0.05 * sl.sum() else sl
+    ym, xm = np.nonzero(m)
+    yr, xr = np.nonzero(ref)
+    return float(xm.mean() - xr.mean()), float(ym.mean() - yr.mean()), iou
+
+
+def shift_pose_last_px(pose_last, K, du, dv, max_shift_px=None):
+    """Move pose_last's translation by (du, dv) pixels at its own depth. Rotation untouched."""
+    P = pose_last.clone()
+    t = P.reshape(-1, 4, 4)[0, :3, 3]
+    z = float(t[2])
+    shift = float(np.hypot(du, dv))
+    if not np.isfinite(z) or z <= 0.01 or (max_shift_px is not None and shift > max_shift_px):
+        return pose_last, shift
+    t[0] += du * z / K[0, 0]
+    t[1] += dv * z / K[1, 1]
+    return P, shift
+
+
 def masked_depth(depth, mask, dilate_px=8):
     """Copy of depth with everything outside the (dilated) mask set to 0 (FoundationPose treats 0 as no depth)."""
     m = mask.astype(np.uint8)

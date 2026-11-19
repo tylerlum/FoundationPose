@@ -77,6 +77,25 @@ Two objects cost two track_one() calls per frame: expect roughly half the
 single-object loop rate.
 --track_hz_2 1 tracks object 2 once per second (a bowl or a screw that stays
 still) and publishes its last pose again between updates: ~11 ms less per frame.
+
+Capture stamps and the payload topics (17 Nov 2026, for the brush + cube sweep):
+
+- Every PoseStamped (camera_frame/ and robot_frame/) is stamped with the ZED
+  image capture time (sl.TIME_REFERENCE.IMAGE, host clock = ROS time) of the
+  frame that produced that object's pose, not the publish time. An object not
+  tracked on a frame (--track_hz_2) keeps the stamp of the frame it was.
+- --payload_object K (1 or 2; 0 = off) also publishes object K's robot-frame
+  pose on --payload_pose_topic (default /perception/payload/pose_robot): the
+  same message as robot_frame/<topic>, so T_RC is applied once. With it,
+  --payload_status_topic (default /perception/payload/status) carries a
+  std_msgs/String JSON {"valid": bool, "stamp": <header.stamp.to_sec() of that
+  pose>, "reason": ..., ...}. valid comes from payload_check.PayloadCheck on
+  that same frame (colour, silhouette IoU, depth surface, jump), whose
+  defaults are the sweep deployment's cube contract (--payload_config reads
+  another JSON's "cube" section). It is false for a lost, hidden, or rejected
+  observation and after a failed registration.
+- A take also writes frame_log.jsonl: per frame, each object's capture stamp
+  and the payload verdict.
 """
 
 import os
@@ -223,14 +242,20 @@ class RosPosePublisher2:
 
     object k publishes on camera_frame/<topics[k]> (header frame_id) and, when
     publish_robot_frame, on robot_frame/<topics[k]> (pose T_RC @ pose_cam).
+    Headers carry the capture stamp passed in (ts_ns, ROS time in ns).
+    payload_k (0-based, or None) also publishes that object's robot-frame
+    message on payload_pose_topic and its validity on payload_status_topic.
     The caller imports rospy BEFORE the FoundationPose stack (see above).
     """
 
-    def __init__(self, frame_id, publish_robot_frame, topics):
+    def __init__(self, frame_id, publish_robot_frame, topics, payload_k=None,
+                 payload_pose_topic=None, payload_status_topic=None):
         import rospy
         from geometry_msgs.msg import PoseStamped
+        from std_msgs.msg import String
         self._rospy = rospy
         self._PoseStamped = PoseStamped
+        self._String = String
         rospy.init_node('foundationpose_live_tracking_2_objects', anonymous=True)
         self.frame_id = frame_id
         self.cam_pubs = [rospy.Publisher(f'camera_frame/{t}', PoseStamped,
@@ -238,10 +263,24 @@ class RosPosePublisher2:
         self.robot_pubs = ([rospy.Publisher(f'robot_frame/{t}', PoseStamped,
                                             queue_size=1) for t in topics]
                            if publish_robot_frame else [None, None])
+        self.payload_k = payload_k
+        self.payload_pose_pub = self.payload_status_pub = None
+        if payload_k is not None:
+            self.payload_pose_pub = rospy.Publisher(payload_pose_topic, PoseStamped,
+                                                    queue_size=1)
+            self.payload_status_pub = rospy.Publisher(payload_status_topic, String,
+                                                      queue_size=1)
 
-    def _msg(self, T, frame_id):
+    def _stamp(self, ts_ns):
+        if ts_ns is None:
+            return self._rospy.Time.now()
+        ts_ns = int(ts_ns)
+        return self._rospy.Time(secs=ts_ns // 1_000_000_000,
+                                nsecs=ts_ns % 1_000_000_000)
+
+    def _msg(self, T, frame_id, stamp):
         msg = self._PoseStamped()
-        msg.header.stamp = self._rospy.Time.now()
+        msg.header.stamp = stamp
         msg.header.frame_id = frame_id
         msg.pose.position.x = float(T[0, 3])
         msg.pose.position.y = float(T[1, 3])
@@ -253,16 +292,34 @@ class RosPosePublisher2:
         msg.pose.orientation.w = float(quat_wxyz[0])
         return msg
 
-    def publish(self, k, pose_cam, T_RC=None):
-        if pose_cam is None:
+    def publish(self, k, pose_cam, T_RC=None, ts_ns=None, status=None):
+        """status: the payload verdict for this pose (dict with 'valid',
+        'reason', ...), used only for object payload_k."""
+        stamp = self._stamp(ts_ns)
+        robot_msg = None
+        if pose_cam is not None and np.isfinite(pose_cam).all():
+            self.cam_pubs[k].publish(self._msg(pose_cam, self.frame_id, stamp))
+            if self.robot_pubs[k] is not None and T_RC is not None:
+                robot_msg = self._msg(T_RC @ pose_cam, 'robot_frame', stamp)
+                self.robot_pubs[k].publish(robot_msg)
+        if k != self.payload_k:
             return
-        self.cam_pubs[k].publish(self._msg(pose_cam, self.frame_id))
-        if self.robot_pubs[k] is not None and T_RC is not None:
-            self.robot_pubs[k].publish(self._msg(T_RC @ pose_cam, 'robot_frame'))
+        if robot_msg is not None:
+            self.payload_pose_pub.publish(robot_msg)
+        status = dict(status or {})
+        body = {'valid': bool(status.get('valid', False)) and robot_msg is not None,
+                'stamp': stamp.to_sec(),
+                'reason': status.get('reason', '') if robot_msg is not None else 'no_pose',
+                'source': 'foundationpose_live_tracking_2_objects'}
+        for key in ('color_px', 'iou', 'depth_px', 'surface_frac', 'jump_m'):
+            if key in status:
+                v = status[key]
+                body[key] = v if (not isinstance(v, float) or math.isfinite(v)) else None
+        self.payload_status_pub.publish(self._String(data=_json.dumps(body)))
 
-    def publish_both(self, poses, T_RC=None):
-        for k in (0, 1):
-            self.publish(k, poses[k], T_RC)
+    def publish_objs(self, objs, T_RC=None):
+        for o in objs:
+            self.publish(o.k, o.pose, T_RC, ts_ns=o.ts_ns, status=o.status)
 
     def shutdown_requested(self):
         return self._rospy.is_shutdown()
@@ -275,7 +332,9 @@ class ReplayCapture:
     (float, m) with the same stems, and cam_K.txt (FoundationPose's demo
     layout). Frames are resized to the tracker's size (fp_size = (W, H)) and K
     is scaled to match. One frame per latest() call; `exhausted` after the
-    last. `frame_name` is the stem of the frame last served.
+    last. `frame_name` is the stem of the frame last served. An optional
+    ts_ns.txt ("<stem> <capture ns>" per line) replays the original capture
+    stamps; without it a frame is stamped when it is read.
     """
 
     def __init__(self, replay_dir, fp_size):
@@ -292,6 +351,12 @@ class ReplayCapture:
         self.exhausted = False
         self.frame_name = None
         self._i = 0
+        self.ts_ns = {}
+        if (self.dir / 'ts_ns.txt').is_file():
+            for line in (self.dir / 'ts_ns.txt').read_text().split('\n'):
+                if line.strip():
+                    stem, ns = line.split()
+                    self.ts_ns[stem] = int(ns)
 
     def start(self, ready_timeout=None):
         K = np.loadtxt(self.dir / 'cam_K.txt').reshape(3, 3)
@@ -319,7 +384,7 @@ class ReplayCapture:
             depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_NEAREST)
         self.frame_name = p.stem
         self._i += 1
-        return self._i, time.time_ns(), rgb, depth
+        return self._i, self.ts_ns.get(p.stem, time.time_ns()), rgb, depth
 
     def stop_capture(self):
         pass
@@ -564,6 +629,19 @@ def _build_parser():
                              '(.npy or .txt) overriding T_RC_DEFAULT.')
     parser.add_argument('--no_robot_frame', action='store_true',
                         help='With --ros, skip the robot_frame publishes.')
+    parser.add_argument('--payload_object', type=int, choices=[0, 1, 2], default=0,
+                        help='With --ros: also publish this object (1 or 2) as the '
+                             'payload: its robot-frame pose on --payload_pose_topic '
+                             'and a JSON validity status on --payload_status_topic. '
+                             '0 = off.')
+    parser.add_argument('--payload_pose_topic', type=str,
+                        default='/perception/payload/pose_robot')
+    parser.add_argument('--payload_status_topic', type=str,
+                        default='/perception/payload/status')
+    parser.add_argument('--payload_config', type=str, default=None,
+                        help='JSON whose "cube" section (or top level) overrides '
+                             'payload_check.SWEEP_CUBE_29MM, e.g. the sweep '
+                             "deployment's sweep_payload_29mm.json.")
     parser.add_argument('--serial_number', type=str, default='15107')
     parser.add_argument('--camera_upsidedown', action='store_true')
     parser.add_argument('--camera_resolution', choices=['HD1080', 'HD720', 'VGA'],
@@ -743,19 +821,50 @@ def _build_parser():
     parser.add_argument('--sam2_ckpt', type=str, default=None,
                         help='SAM2 checkpoint (default: the real-time fork tiny under /home/tylerlum/.deps_sam2rt_20261029)')
     parser.add_argument('--sam2_cfg', type=str, default=None, help='SAM2 config name (default sam2_hiera_t.yaml)')
+    parser.add_argument('--sam2_image_size', type=int, default=1024,
+                        help='SAM2 input size (multiple of 32). 640: ~13 ms/frame vs ~21 ms at 1024 on the 4090, '
+                             'mask IoU 0.958 vs 0.964 (18 Nov synthetic test).')
+    parser.add_argument('--sam2_async', action='store_true',
+                        help='Run SAM2 on its own thread / CUDA stream (overlaps FoundationPose). Each frame then uses '
+                             'the previous frame\'s mask, compared with the previous frame\'s pose.')
+    parser.add_argument('--sam2_cpu_prep', action='store_true',
+                        help='Use SAM2\'s stock CPU frame preparation (default: same steps on the GPU, ~12 ms faster).')
+    parser.add_argument('--check_cpu_silhouette', action='store_true',
+                        help='Rasterise the check silhouette on the CPU (default: nvdiffrast, ~3 ms vs ~12 ms).')
     parser.add_argument('--sam2_every', type=int, default=1,
                         help='Run SAM2 every N frames (~18 ms each, tiny, 960 x 540); reuse its last mask between.')
     parser.add_argument('--lost_iou', type=float, default=0.1)
     parser.add_argument('--lost_px', type=float, default=30.0)
     parser.add_argument('--lost_frames', type=int, default=4)
+    parser.add_argument('--lost_metric', choices=['iou', 'cover'], default='iou',
+                        help='cover (18 Nov, for held tools): bad when < --lost_cover of SAM2\'s mask lies inside '
+                             'FoundationPose\'s silhouette (iou is ~0.1 under heavy occlusion even when right).')
+    parser.add_argument('--lost_cover', type=float, default=0.3)
+    parser.add_argument('--lost_try_anchor', action='store_true',
+                        help='When lost, first move the last pose onto SAM2\'s mask (silhouette delta) and refine with '
+                             '--lost_anchor_iter track iterations on mask-blanked depth; keep it if coverage >= '
+                             '--lost_anchor_accept, else re-register as before (a re-register from a sliver can flip).')
+    parser.add_argument('--lost_anchor_iter', type=int, default=4)
+    parser.add_argument('--lost_anchor_accept', type=float, default=0.6)
     parser.add_argument('--lost_action', choices=['report', 'reregister'], default='reregister')
     parser.add_argument('--lost_cooldown_s', type=float, default=1.0)
     parser.add_argument('--lost_mask_max_ratio', type=float, default=3.0,
                         help='Re-register from SAM2 only if its mask is <= this x the registration mask (not the hand).')
     # FoundationPose++-style aids (fpp_tracking.py, 18 Nov 2026); all need --sam2_tool, all default off.
+    parser.add_argument('--save_depth', action='store_true',
+                        help='Also write <take>/replay/ (rgb/*.png, depth/*.png uint16 mm, ts_ns.txt, cam_K.txt, '
+                             'masks_1/2 from the first frame\'s poses) so the take can be re-run with --replay_dir. '
+                             '~1 MB RAM per buffered frame; saving takes a few seconds longer.')
     parser.add_argument('--fpp_anchor_xy', action='store_true',
                         help='Before track_one, move object 1\'s starting pose so its centre projects onto the centre '
                              'of SAM2\'s mask (FoundationPose++). SAM2 then runs every frame.')
+    parser.add_argument('--fpp_anchor_mode', choices=['silhouette', 'centre'], default='silhouette',
+                        help='silhouette: shift by (mask centre - centre of the silhouette part inside the mask), only '
+                             'when coverage < --fpp_anchor_gate_cover (leaves good tracks alone). centre: '
+                             'FoundationPose++\'s rule, put the pose centre on the mask centre every frame.')
+    parser.add_argument('--fpp_anchor_gate_cover', type=float, default=0.7,
+                        help='Silhouette anchor only when less than this fraction of SAM2\'s mask lies inside '
+                             'FoundationPose\'s silhouette (i.e. it has started to slide off).')
     parser.add_argument('--fpp_max_shift_px', type=float, default=60.0,
                         help='Skip the xy anchor on frames where it would move the start more than this (px).')
     parser.add_argument('--fpp_mask_depth_px', type=int, default=-1,
@@ -827,6 +936,9 @@ class _Obj:
         self.pose = None
         self.upright = False
         self.n_turned = 0          # registrations turned upright
+        self.ts_ns = None          # capture stamp of the frame behind self.pose
+        self.status = None         # payload verdict for self.pose (payload object only)
+        self.check = None          # PayloadCheck (payload object only)
 
     @property
     def name(self):
@@ -889,8 +1001,26 @@ def main():
         T_up = T_RC_DEFAULT
     up_cam = np.asarray(T_up, dtype=np.float64)[:3, :3].T @ np.array([0.0, 0.0, 1.0])
 
+    payload_k = args.payload_object - 1 if args.payload_object else None
+    payload_cfg = None
+    if payload_k is not None:
+        if T_RC is None:
+            sys.exit('--payload_object needs --ros and the robot frame '
+                     '(not --no_robot_frame)')
+        from payload_check import SWEEP_CUBE_29MM
+        payload_cfg = dict(SWEEP_CUBE_29MM)
+        if args.payload_config:
+            with open(args.payload_config) as fh:
+                _pc = _json.load(fh)
+            _pc = _pc.get('cube', _pc)
+            payload_cfg.update({k: _pc[k] for k in SWEEP_CUBE_29MM if k in _pc})
+        print(f'[payload] object {args.payload_object} -> {args.payload_pose_topic} + '
+              f'{args.payload_status_topic}; check {payload_cfg}', flush=True)
+
     ros_pub = (RosPosePublisher2(args.frame_id, publish_robot_frame=(T_RC is not None),
-                                 topics=[o.topic for o in objs])
+                                 topics=[o.topic for o in objs], payload_k=payload_k,
+                                 payload_pose_topic=args.payload_pose_topic,
+                                 payload_status_topic=args.payload_status_topic)
                if args.ros else None)
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -902,6 +1032,8 @@ def main():
                                 'publish', 'total')}
     viz_log = _deque(maxlen=buffer_frame_cap)
     robust_log = _deque(maxlen=buffer_frame_cap)     # robust copy: object 1's SAM2 check per recorded frame
+    frame_log = _deque(maxlen=buffer_frame_cap)   # per frame: capture stamps + payload verdict
+    depth_frames = _deque(maxlen=buffer_frame_cap)   # --save_depth: uint16 mm per recorded frame
     if buffer_frame_cap is None:
         print('[buffer] frame buffer cap disabled')
     else:
@@ -932,8 +1064,10 @@ def main():
             v.clear()
         viz_log.clear()
         robust_log.clear()
+        frame_log.clear()
+        depth_frames.clear()
 
-    def _write_take(reason, raw, poses, fts, sts, vizs, started):
+    def _write_take(reason, raw, poses, fts, sts, vizs, started, flog, dlog=None):
         """Encode and write one take from a snapshot of the buffers."""
         _t_enc = time.time()
         n = len(raw)
@@ -991,20 +1125,49 @@ def main():
                         for r in list(robust_log)]
                 with open(os.path.join(take_dir, 'robust_log.json'), 'w') as fh:
                     _json.dump(rows, fh)
+            meta['stamps'] = 'ZED image capture time (sl.TIME_REFERENCE.IMAGE), ROS time'
+            meta['payload'] = (None if payload_k is None else {
+                'object': args.payload_object, 'pose_topic': args.payload_pose_topic,
+                'status_topic': args.payload_status_topic,
+                'config_file': (os.path.abspath(args.payload_config)
+                                if args.payload_config else None),
+                'check': payload_cfg,
+                'n_valid': int(sum(1 for r in flog if r.get('payload_valid'))),
+                'n_frames': len(flog)})
             with open(os.path.join(take_dir, 'metadata.json'), 'w') as fh:
                 _json.dump(meta, fh, indent=2)
+            with open(os.path.join(take_dir, 'frame_log.jsonl'), 'w') as fh:
+                for r in flog:
+                    fh.write(_json.dumps(r) + '\n')
             if vizs and K is not None and args.viz_data:
                 _save_viz_data_2(take_dir, vizs, poses, K, args.viz_stride,
                                  [o.mesh_path for o in objs],
                                  compress=args.viz_compress)
             print(f'[autorecord] saved {n} frames -> {take_dir} ({reason}) '
                   f'[encode {time.time()-_t_enc:.1f}s]', flush=True)
+        if take_dir and dlog and len(dlog) == n:
+            _t_d = time.time()
+            rd = os.path.join(take_dir, 'replay')
+            for sub in ('rgb', 'depth', 'masks_1', 'masks_2'):
+                os.makedirs(os.path.join(rd, sub), exist_ok=True)
+            for i in range(n):
+                cv2.imwrite(os.path.join(rd, 'rgb', f'{i:05d}.png'), cv2.cvtColor(raw[i], cv2.COLOR_RGB2BGR))
+                cv2.imwrite(os.path.join(rd, 'depth', f'{i:05d}.png'), dlog[i])
+            np.savetxt(os.path.join(rd, 'cam_K.txt'), K)
+            with open(os.path.join(rd, 'ts_ns.txt'), 'w') as fh:
+                fh.write(''.join(f'{i:05d} {int(flog[i]["capture_ns"])}\n' for i in range(min(n, len(flog)))))
+            import robust_tool as _rt
+            for o in objs:
+                T0 = poses[o.k][0] if poses[o.k] else None
+                m = _rt.ToolCheck(o.mesh, K, args.width, args.height).silhouette(T0)
+                cv2.imwrite(os.path.join(rd, f'masks_{o.k + 1}', '00000.png'), (m * 255).astype(np.uint8))
+            print(f'[save_depth] wrote {rd} ({n} frames, {time.time() - _t_d:.1f}s)', flush=True)
         return take_dir
 
     def _snapshot():
         return (list(raw_frames), [list(pose_logs[0]), list(pose_logs[1])],
                 list(frame_times), {k: list(v) for k, v in stage_times.items()},
-                list(viz_log), _save_loop_start_time())
+                list(viz_log), _save_loop_start_time(), list(frame_log), list(depth_frames))
 
     def _save_take(reason, clear=True):
         """Save the take, blocking until it is on disk (as the one-object
@@ -1110,6 +1273,27 @@ def main():
             o.mesh, o.mesh_path = mesh, mesh_path
             o.upright = (not args.no_upright
                          and Path(mesh_path).stem in set(args.upright_meshes))
+            if o.k == payload_k:
+                from payload_check import PayloadCheck
+                from Utils import make_mesh_tensors
+                o.check = PayloadCheck(make_mesh_tensors(mesh), K, args.width,
+                                       args.height, glctx, **payload_cfg)
+                o.status = dict(valid=False, reason='not_registered')
+
+        def _observe(o, rgb, depth, ts_ns, registered=False):
+            """o.pose now comes from the frame captured at ts_ns: record the
+            stamp and, for the payload, judge that frame."""
+            o.ts_ns = ts_ns
+            if o.check is None:
+                return
+            if registered:
+                o.check.reset()
+            o.status = o.check.check(rgb, depth, o.pose, ts_ns * 1e-9)
+
+        def _reject(o, reason):
+            """The pose was not refreshed from a frame (failed registration)."""
+            if o.check is not None:
+                o.status = dict(valid=False, reason=reason)
 
         for o in objs:
             _set_mesh(o, o.mesh_path)
@@ -1250,7 +1434,7 @@ def main():
                       'it over (+z now up)', flush=True)
             return pose
 
-        rgb, depth, _, _, _ = fetch()
+        rgb, depth, ts0, _, _ = fetch()
         for o in objs:
             mask = _get_mask(o, rgb)
             if mask is None or mask.sum() == 0:
@@ -1259,11 +1443,12 @@ def main():
             print(f'Registering object {o.k + 1} ({o.name})...')
             t0 = time.time()
             o.pose = _register(o, rgb, depth, mask)
+            _observe(o, rgb, depth, ts0, registered=True)
             print(f'Object {o.k + 1} registered in {time.time()-t0:.3f}s')
             if o.k == 0:
                 tool_mask0 = mask
         if ros_pub is not None:
-            ros_pub.publish_both([o.pose for o in objs], T_RC)
+            ros_pub.publish_objs(objs, T_RC)
 
         # ---- SAM2 checks / end-face tag on object 1 (robust copy) -------------
         sam = check = tag = None
@@ -1276,10 +1461,15 @@ def main():
         if args.sam2_tool:
             _t = time.time()
             sam = robust_tool.SamTool(ckpt=args.sam2_ckpt or robust_tool.SAM2_CKPT,
-                                      cfg=args.sam2_cfg or robust_tool.SAM2_CFG)
+                                      cfg=args.sam2_cfg or robust_tool.SAM2_CFG,
+                                      image_size=args.sam2_image_size, gpu_prep=not args.sam2_cpu_prep)
             box, pt = sam.reset(rgb, tool_mask0)
+            if args.sam2_async:
+                sam = robust_tool.AsyncSam(sam)
             check = robust_tool.ToolCheck(objs[0].mesh, K, args.width, args.height, lost_iou=args.lost_iou,
-                                          lost_px=args.lost_px, lost_frames=args.lost_frames)
+                                          lost_px=args.lost_px, lost_frames=args.lost_frames,
+                                          glctx=None if args.check_cpu_silhouette else glctx,
+                                          metric=args.lost_metric, lost_cover=args.lost_cover)
             robust_state['mask0_px'] = int(np.asarray(tool_mask0).astype(bool).sum())
             print(f'[sam2] object 1 tracked by SAM2 ({time.time() - _t:.1f}s to load; box '
                   f'{np.round(box).astype(int).tolist()}, point {np.round(pt[0]).astype(int).tolist()}); lost = iou < '
@@ -1321,17 +1511,35 @@ def main():
             raise SystemExit('--fpp_anchor_xy / --fpp_mask_depth_px / --fpp_filter need --sam2_tool (SAM2 gives the mask)')
         if fpp_on:
             import fpp_tracking
-            print(f'[fpp] object 1: anchor_xy={args.fpp_anchor_xy} (max {args.fpp_max_shift_px:g} px), '
-                  f'mask_depth_px={args.fpp_mask_depth_px}, filter={args.fpp_filter}; SAM2 every frame', flush=True)
+            print(f'[fpp] object 1: anchor_xy={args.fpp_anchor_xy} ({args.fpp_anchor_mode}, max '
+                  f'{args.fpp_max_shift_px:g} px), mask_depth_px={args.fpp_mask_depth_px}, filter={args.fpp_filter}; '
+                  f'on SAM2 frames (every {max(args.sam2_every, 1)})', flush=True)
         pose_filter = fpp_tracking.PoseFilter() if args.fpp_filter else None
-        fpp_mask = dict(m=None, ms=0.0)     # SAM2 mask made before track_one this frame; _robust_step reuses it
+        fpp_mask = dict(m=None, ms=0.0, pose=None)  # SAM2 mask made before track_one this frame; _robust_step reuses it
+        robust_state['prev_pose'] = None             # --sam2_async: object 1's pose on the frame the mask comes from
+
+        def _sam_mask(rgb):
+            """(mask, ms, pose the mask should be compared with). Sync: this frame's mask, pose None (= current).
+            Async: submit this frame, return the newest finished mask (normally the previous frame's) and that frame's
+            pose; (None, 0, None) until the first result."""
+            if not args.sam2_async:
+                _t0 = time.time()
+                return sam.track(rgb), (time.time() - _t0) * 1e3, None
+            res = sam.latest()
+            sam.submit(rgb, robust_state['frame'])
+            if res is None:
+                return None, 0.0, None
+            return res[0], res[2], robust_state['prev_pose']
 
         def _fpp_pre(o, rgb, depth):
             """SAM2 on this frame, then (if its mask is usable) the FoundationPose++ aids on object 1's starting
-            pose and depth. Returns (depth for track_one, log fields)."""
-            _t0 = time.time()
-            m = sam.track(rgb)
-            fpp_mask['m'], fpp_mask['ms'] = m, (time.time() - _t0) * 1e3
+            pose and depth. Returns (depth for track_one, log fields). Frames between SAM2 frames run plain."""
+            if (robust_state['frame'] + 1) % max(args.sam2_every, 1) != 0:
+                return depth, dict(fpp_px=0, fpp_used=False, fpp_shift_px=float('nan'))
+            m, ms, pose_m = _sam_mask(rgb)
+            if m is None:
+                return depth, dict(fpp_px=0, fpp_used=False, fpp_shift_px=float('nan'))
+            fpp_mask['m'], fpp_mask['ms'], fpp_mask['pose'] = m, ms, pose_m
             n = int(m.sum())
             row = dict(fpp_px=n, fpp_used=False, fpp_shift_px=float('nan'))
             if not (args.fpp_min_mask_px <= n <= args.lost_mask_max_ratio * max(robust_state['mask0_px'], 1)):
@@ -1342,12 +1550,40 @@ def main():
                 if P is not None:
                     o.est.pose_last = torch.as_tensor(P, device=o.est.pose_last.device,
                                                       dtype=o.est.pose_last.dtype).reshape(o.est.pose_last.shape)
-            if args.fpp_anchor_xy:
+            if args.fpp_anchor_xy and args.fpp_anchor_mode == 'centre':
                 o.est.pose_last, row['fpp_shift_px'] = fpp_tracking.anchor_xy(
                     o.est.pose_last, K, fpp_tracking.mask_centre(m), args.fpp_max_shift_px)
+            elif args.fpp_anchor_xy:
+                sil = check.silhouette(o.pose if pose_m is None else pose_m)
+                dl = fpp_tracking.silhouette_delta(m, sil)
+                if dl is not None:
+                    cover = (m & sil).sum() / max(int(m.sum()), 1)
+                    row['fpp_iou'], row['fpp_cover'] = dl[2], cover
+                    if cover < args.fpp_anchor_gate_cover:
+                        o.est.pose_last, row['fpp_shift_px'] = fpp_tracking.shift_pose_last_px(
+                            o.est.pose_last, K, dl[0], dl[1], args.fpp_max_shift_px)
             if args.fpp_mask_depth_px >= 0:
                 depth = fpp_tracking.masked_depth(depth, m, args.fpp_mask_depth_px)
             return depth, row
+
+        def _try_anchor(o, rgb, depth, mask):
+            """Lost recovery without re-registration: shift the starting pose onto SAM2's mask, refine on
+            mask-blanked depth, accept if enough of the mask then lies inside the silhouette."""
+            import fpp_tracking as _fpp
+            keep_pl, keep_pose = o.est.pose_last.clone(), o.pose
+            dl = _fpp.silhouette_delta(mask, check.silhouette(o.pose))
+            if dl is None:
+                return False
+            o.est.pose_last, _ = _fpp.shift_pose_last_px(o.est.pose_last, K, dl[0], dl[1])
+            T = o.est.track_one(rgb=rgb, depth=_fpp.masked_depth(depth, mask, 8), K=K,
+                                iteration=args.lost_anchor_iter)
+            sil = check.silhouette(T)
+            cover = (mask & sil).sum() / max(int(mask.sum()), 1)
+            if cover >= args.lost_anchor_accept:
+                o.pose = T
+                return True
+            o.est.pose_last, o.pose = keep_pl, keep_pose
+            return False
 
         def _set_state(o, T):
             """Restart FoundationPose's track_one from pose T (mesh frame, camera)."""
@@ -1415,18 +1651,19 @@ def main():
                         robust_state['n_tag_fix'] += 1
             c = dict(badness=0.0, lost=False, iou=float('nan'), dpx=float('nan'))
             if sam is not None:
+                pose_m = None
                 if fpp_mask['m'] is not None:          # already run before track_one (--fpp_*)
-                    mask, row['sam_ms'] = fpp_mask['m'], fpp_mask['ms']
+                    mask, row['sam_ms'], pose_m = fpp_mask['m'], fpp_mask['ms'], fpp_mask['pose']
                     fpp_mask['m'] = None
                 elif robust_state['frame'] % max(args.sam2_every, 1) == 0:
-                    _t0 = time.time()
-                    mask = sam.track(rgb)
-                    row['sam_ms'] = (time.time() - _t0) * 1e3
+                    mask, row['sam_ms'], pose_m = _sam_mask(rgb)
                 else:
                     mask = sam.last
-                c = check.check(mask, o.pose)
+                c = check.check(mask, o.pose if pose_m is None else pose_m)
+                robust_state['prev_pose'] = None if o.pose is None else np.array(o.pose)
                 robust_state['last_iou'] = c['iou']
                 row.update({k: c[k] for k in ('iou', 'dpx', 'badness', 'bad', 'lost', 'sam_px', 'fp_px', 'usable')})
+                row['cover'] = c.get('cover', float('nan'))
                 if c['lost']:
                     robust_state['n_lost'] += 1
                 if (c['lost'] and args.lost_action == 'reregister'
@@ -1436,6 +1673,8 @@ def main():
                     if T is not None and not (args.reseed_message_action == 'register' and sam_ok):
                         _set_state(o, T)
                         row['action'] = 'reseed_node'
+                    elif sam_ok and args.lost_try_anchor and _try_anchor(o, rgb, depth, mask):
+                        row['action'] = 'anchor_sam2'
                     elif sam_ok:
                         try:
                             o.pose = _register(o, rgb, depth, mask)
@@ -1581,7 +1820,7 @@ def main():
                   f'{[k + 1 for k in which]} ({reason}); dropped {n_dropped} '
                   'buffered frames', flush=True)
             _t_rr = time.time()
-            rgb_r, depth_r, _, _, _ = fetch()
+            rgb_r, depth_r, ts_r, _, _ = fetch()
             for k in which:
                 o = objs[k]
                 _t_mask = time.time()
@@ -1591,6 +1830,7 @@ def main():
                 if mask_r is None or mask_r.sum() == 0:
                     print(f'[live_tracking]   object {k + 1}: no mask; keeping '
                           'its previous pose', flush=True)
+                    _reject(o, 'register_no_mask')
                     continue
                 _t_reg = time.time()
                 try:
@@ -1598,7 +1838,9 @@ def main():
                 except RuntimeError as exc:
                     print(f'[live_tracking]   {exc}; keeping its previous pose',
                           flush=True)
+                    _reject(o, 'register_failed')
                     continue
+                _observe(o, rgb_r, depth_r, ts_r, registered=True)
                 print(f'[live_tracking]   object {k + 1} re-registered in '
                       f'{time.time()-_t_reg:.2f}s', flush=True)
                 if k == 0 and pose_filter is not None:
@@ -1611,7 +1853,7 @@ def main():
             print(f'[live_tracking]   total {time.time()-_t_rr:.2f}s', flush=True)
             _clear_buffers()
             if ros_pub is not None:
-                ros_pub.publish_both([o.pose for o in objs], T_RC)
+                ros_pub.publish_objs(objs, T_RC)
             _show_control_window()
             loop_start_time = time.time()
             return True
@@ -1660,7 +1902,7 @@ def main():
                 loop_start = time.time()
 
                 try:
-                    rgb, depth, _ts, t_grab, t_depth = fetch()
+                    rgb, depth, ts_ns, t_grab, t_depth = fetch()
                 except _ReplayDone:
                     print('\n[replay] last frame reached', flush=True)
                     break
@@ -1681,6 +1923,7 @@ def main():
                         pose_filter.update(o.est.pose_last.reshape(-1, 4, 4)[0].detach().cpu().numpy())
                     if _forced(o):
                         o.pose = _snap_upright(o)
+                    _observe(o, rgb, depth, ts_ns)
                     if o.k == 0 and (sam is not None or tag is not None):
                         _rrow = _robust_step(o, rgb, depth)
                         if _fpp_row is not None:
@@ -1692,7 +1935,7 @@ def main():
                 t_publish = 0.0
                 if ros_pub is not None:
                     t0 = time.time()
-                    ros_pub.publish_both([o.pose for o in objs], T_RC)
+                    ros_pub.publish_objs(objs, T_RC)
                     t_publish = time.time() - t0
 
                 if live_view is not None:
@@ -1703,8 +1946,22 @@ def main():
                 # Gated on `recording`, as in the one-object GUI script.
                 if recording:
                     raw_frames.append(rgb)
+                    if args.save_depth:
+                        depth_frames.append(np.clip(np.nan_to_num(depth) * 1000, 0, 65535).astype(np.uint16))
                     for o in objs:
                         pose_logs[o.k].append(o.pose)
+                    _row = {'capture_ns': int(ts_ns),
+                            'object_capture_ns': [None if o.ts_ns is None else int(o.ts_ns)
+                                                  for o in objs]}
+                    if payload_k is not None:
+                        _st = objs[payload_k].status or {}
+                        _row['payload_valid'] = bool(_st.get('valid', False))
+                        _row['payload_reason'] = _st.get('reason', '')
+                        for _key in ('color_px', 'iou', 'depth_px', 'surface_frac', 'jump_m'):
+                            if _key in _st and not (isinstance(_st[_key], float)
+                                                    and not math.isfinite(_st[_key])):
+                                _row[_key] = _st[_key]
+                    frame_log.append(_row)
                     if _want_viz:
                         s = args.viz_stride
                         viz_log.append((rgb[::s, ::s].copy(),

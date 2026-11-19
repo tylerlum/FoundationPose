@@ -40,7 +40,7 @@ def mask_prompt(mask):
 class SamTool:
     """SAM2's camera predictor for one object. reset(rgb, mask) starts it on a frame; track(rgb) -> bool mask."""
 
-    def __init__(self, ckpt=SAM2_CKPT, cfg=SAM2_CFG, device='cuda'):
+    def __init__(self, ckpt=SAM2_CKPT, cfg=SAM2_CFG, device='cuda', image_size=1024, gpu_prep=True):
         for p in (SAM2_ROOT / 'pylibs', SAM2_ROOT / 'segment-anything-2-real-time'):
             if str(p) not in sys.path:
                 sys.path.insert(0, str(p))
@@ -49,9 +49,23 @@ class SamTool:
         self.torch = torch
         # FoundationPose's stack makes CUDA the default device; SAM2's frame preparation mixes torch.from_numpy (CPU)
         # with torch.tensor (default device). Run SAM2 with a CPU default, as it runs standalone.
+        extra = [] if int(image_size) == 1024 else [f'++model.image_size={int(image_size)}']
         with torch.device('cpu'):
-            self.pred = build_sam2_camera_predictor(cfg, str(ckpt), device=device)
+            self.pred = build_sam2_camera_predictor(cfg, str(ckpt), device=device, hydra_overrides_extra=extra)
         self.pred.fill_hole_area = 0            # hole filling needs the compiled _C, which is not copied
+        if gpu_prep:
+            # Stock prepare_data resizes to image_size x image_size and normalises on the CPU in float64 (~12 ms at
+            # 960 x 540 -> 1024). Same steps on the GPU: < 1 ms. (18 Nov: track 35 -> 21 ms at 1024, 13 ms at 640.)
+            def _prep(img, image_size=self.pred.image_size, img_mean=(0.485, 0.456, 0.406),
+                      img_std=(0.229, 0.224, 0.225)):
+                h, w = img.shape[:2]
+                x = torch.from_numpy(np.ascontiguousarray(img)).to(device).permute(2, 0, 1)[None].float() / 255.0
+                x = torch.nn.functional.interpolate(x, size=(image_size, image_size), mode='bilinear',
+                                                    align_corners=False)[0]
+                m = torch.tensor(img_mean, device=device)[:, None, None]
+                sd = torch.tensor(img_std, device=device)[:, None, None]
+                return (x - m) / sd, w, h
+            self.pred.prepare_data = _prep
         self.started = False
         self.last = None
 
@@ -80,19 +94,112 @@ class SamTool:
         return self.last
 
 
+class AsyncSam:
+    """Runs SamTool.track on its own thread and CUDA stream so SAM2 overlaps FoundationPose (18 Nov). submit(rgb, tag)
+    hands over the newest frame (an older pending one is dropped); latest() is the newest finished (mask, tag, ms), i.e.
+    usually the previous frame's mask. reset() is synchronous."""
+
+    def __init__(self, sam):
+        import threading
+        import torch
+        self.sam, self.torch = sam, torch
+        self.stream = torch.cuda.Stream()
+        self.cv = threading.Condition()
+        self.pending, self.result, self.busy, self.stop = None, None, False, False
+        self.thread = threading.Thread(target=self._run, daemon=True, name='sam2-async')
+        self.thread.start()
+
+    @property
+    def last(self):
+        return self.sam.last
+
+    def _run(self):
+        import time as _time
+        while True:
+            with self.cv:
+                while self.pending is None and not self.stop:
+                    self.cv.wait()
+                if self.stop:
+                    return
+                rgb, tag = self.pending
+                self.pending, self.busy = None, True
+            t0 = _time.time()
+            with self.torch.cuda.stream(self.stream):
+                m = self.sam.track(rgb)
+            with self.cv:
+                self.result, self.busy = (m, tag, (_time.time() - t0) * 1e3), False
+                self.cv.notify_all()
+
+    def submit(self, rgb, tag):
+        with self.cv:
+            self.pending = (rgb, tag)
+            self.cv.notify_all()
+
+    def latest(self):
+        with self.cv:
+            return self.result
+
+    def _idle(self):
+        with self.cv:
+            self.pending = None
+            while self.busy:
+                self.cv.wait()
+
+    def reset(self, rgb, mask):
+        self._idle()
+        self.torch.cuda.synchronize()
+        out = self.sam.reset(rgb, mask)
+        with self.cv:
+            self.result = None
+        return out
+
+    def track(self, rgb):                       # synchronous fallback (used by the re-register paths)
+        self._idle()
+        return self.sam.track(rgb)
+
+    def close(self):
+        with self.cv:
+            self.stop = True
+            self.cv.notify_all()
+
+
 class ToolCheck:
     """FoundationPose's silhouette vs a 2D mask. A frame is bad when the IoU is below lost_iou AND the centres are
     more than lost_px apart; lost after lost_frames bad frames in a row. badness: 0 when they agree (iou >= 2 x
     lost_iou or centres within lost_px), 1 when clearly apart (iou 0 and centres >= 2 x lost_px)."""
 
-    def __init__(self, mesh, K, W, H, lost_iou=0.1, lost_px=30.0, lost_frames=4, min_mask_px=60):
+    def __init__(self, mesh, K, W, H, lost_iou=0.1, lost_px=30.0, lost_frames=4, min_mask_px=60, glctx=None,
+                 metric='iou', lost_cover=0.3):
         self.v = np.asarray(mesh.vertices, np.float64)
         self.f = np.asarray(mesh.faces, np.int64)
         self.K, self.W, self.H = np.asarray(K, np.float64), int(W), int(H)
         self.lost_iou, self.lost_px, self.lost_frames, self.min_mask_px = lost_iou, lost_px, lost_frames, min_mask_px
         self.n_bad = 0
+        # metric 'cover' (18 Nov): SAM2's mask is only the VISIBLE part of a held tool, so its IoU with the full
+        # silhouette is ~0.1 under heavy occlusion even when FoundationPose is right (false LOST -> re-register from a
+        # sliver -> flipped pose). 'cover' = fraction of the mask inside the silhouette (~1 when right, even occluded)
+        # and the centre distance is to the part of the silhouette near the mask.
+        self.metric, self.lost_cover = metric, lost_cover
+        # glctx (nvdiffrast): render the silhouette on the GPU (~3 ms) instead of the per-triangle CPU loop
+        # (~11-13 ms for the 12.8k-face brush; 18 Nov).
+        self.glctx, self._mt = glctx, None
+        if glctx is not None:
+            from Utils import make_mesh_tensors
+            self._mt = make_mesh_tensors(mesh)
 
     def silhouette(self, T):
+        if self.glctx is not None:
+            if T is None or not np.isfinite(T).all() or T[2, 3] <= 0.01:
+                return np.zeros((self.H, self.W), bool)
+            import torch
+            from Utils import nvdiffrast_render
+            Tt = torch.as_tensor(np.asarray(T, np.float32)[None], device='cuda')
+            _, dep, _ = nvdiffrast_render(K=self.K, H=self.H, W=self.W, ob_in_cams=Tt, glctx=self.glctx,
+                                          mesh_tensors=self._mt)
+            return (dep[0] > 0).cpu().numpy()
+        return self.silhouette_cpu(T)
+
+    def silhouette_cpu(self, T):
         m = np.zeros((self.H, self.W), np.uint8)
         if T is None or not np.isfinite(T).all():
             return m.astype(bool)
@@ -110,24 +217,39 @@ class ToolCheck:
     def check(self, mask, T):
         sil = self.silhouette(T)
         out = dict(iou=float('nan'), dpx=float('nan'), sam_px=int(mask.sum()) if mask is not None else 0,
-                   fp_px=int(sil.sum()), badness=0.0, bad=False, lost=False, usable=False)
+                   fp_px=int(sil.sum()), badness=0.0, bad=False, lost=False, usable=False, cover=float('nan'))
         if mask is None or out['sam_px'] < self.min_mask_px:
             self.n_bad = 0                       # no usable 2D mask (hidden or SAM2 lost it): no verdict
             return out
         out['usable'] = True
-        inter, union = int((mask & sil).sum()), int((mask | sil).sum())
+        # Work inside the padded bounding box of mask | silhouette (full-frame bool ops cost ~10 ms).
+        both = mask | sil
+        rows, cols = np.nonzero(both.any(1))[0], np.nonzero(both.any(0))[0]
+        pad = 20
+        y0, y1 = max(rows[0] - pad, 0), min(rows[-1] + pad + 1, self.H)
+        x0, x1 = max(cols[0] - pad, 0), min(cols[-1] + pad + 1, self.W)
+        m, sl = mask[y0:y1, x0:x1], sil[y0:y1, x0:x1]
+        inter, union = int((m & sl).sum()), int((m | sl).sum())
         out['iou'] = inter / union if union else 0.0
-        ys, xs = np.nonzero(mask)
+        out['cover'] = inter / max(out['sam_px'], 1)
+        ys, xs = np.nonzero(m)
         c_m = np.array([xs.mean(), ys.mean()])
-        if out['fp_px'] > 0:
-            ys2, xs2 = np.nonzero(sil)
+        ref = sl
+        if self.metric == 'cover':
+            near = cv2.dilate(m.astype(np.uint8), np.ones((31, 31), np.uint8)) > 0
+            part = sl & near
+            if part.sum() >= 0.05 * max(out['fp_px'], 1):
+                ref = part
+        if ref.any():
+            ys2, xs2 = np.nonzero(ref)
             out['dpx'] = float(np.linalg.norm(c_m - [xs2.mean(), ys2.mean()]))
         else:
             out['dpx'] = float('inf')            # FoundationPose's pose is off screen or behind the camera
-        a = np.clip(1.0 - out['iou'] / (2 * self.lost_iou), 0.0, 1.0)
+        score, thr = (out['cover'], self.lost_cover) if self.metric == 'cover' else (out['iou'], self.lost_iou)
+        a = np.clip(1.0 - score / (2 * thr), 0.0, 1.0)
         b = np.clip(out['dpx'] / self.lost_px - 1.0, 0.0, 1.0)
         out['badness'] = float(a * b)
-        out['bad'] = out['iou'] < self.lost_iou and out['dpx'] > self.lost_px
+        out['bad'] = score < thr and out['dpx'] > self.lost_px
         self.n_bad = self.n_bad + 1 if out['bad'] else 0
         out['lost'] = self.n_bad >= self.lost_frames
         return out
