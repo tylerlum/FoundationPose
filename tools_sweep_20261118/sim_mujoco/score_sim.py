@@ -67,14 +67,21 @@ def score(take, run):
             while j + 1 < len(served) and served[j + 1][0] <= g:
                 j += 1
             hold.append((g, served[j][1]))
-        e_add, e_t, e_r, v = [], [], [], []
+        e_add, e_t, e_r, v, e_adds = [], [], [], [], []
+        from scipy.spatial import cKDTree
         for gi, i in hold:
             T = P[i]
             if not np.isfinite(T).all():
-                e_add.append(np.inf); e_t.append(np.inf); e_r.append(np.inf); v.append(vis[gi])
+                e_add.append(np.inf); e_t.append(np.inf); e_r.append(np.inf); v.append(vis[gi]); e_adds.append(np.inf)
                 continue
             G = gt[k][gi]
             e_add.append(add(T, G, pts_for(take, k)))
+            if k == 1:   # ADD-S: symmetric version (nearest model point), for tools that look the same flipped
+                pp = pts_for(take, k)
+                tree = cKDTree(pp @ T[:3, :3].T + T[:3, 3])
+                e_adds.append(float(tree.query(pp @ G[:3, :3].T + G[:3, 3])[0].mean()))
+            else:
+                e_adds.append(np.nan)
             e_t.append(np.linalg.norm(T[:3, 3] - G[:3, 3]))
             ang = np.degrees(R.from_matrix(G[:3, :3].T @ T[:3, :3]).magnitude())
             if k == 2:  # cube: 24-fold symmetry -> smallest angle to a cube rotation
@@ -83,13 +90,14 @@ def score(take, run):
                 e_add[-1] = e_t[-1]
             e_r.append(ang)
             v.append(vis[gi])
-        e_add, e_t, e_r, v = map(np.asarray, (e_add, e_t, e_r, v))
+        e_add, e_t, e_r, v, e_adds = map(np.asarray, (e_add, e_t, e_r, v, e_adds))
         lost = e_add > 0.05
         n = len(e_add)
         out[k] = dict(n=n, add_med_mm=float(np.median(e_add) * 1000), add_p90_mm=float(np.percentile(e_add, 90) * 1000),
                       t_med_mm=float(np.median(e_t) * 1000), r_med_deg=float(np.median(e_r)),
                       ok2cm=float((e_add < 0.02).mean() * 100), lost=int(lost.sum()), lost_streak=streak(lost),
                       end_add_mm=float(np.median(e_add[-15:]) * 1000),
+                      adds_ok2cm=float((e_adds < 0.02).mean() * 100) if k == 1 else float('nan'),
                       occl_add_mm=float(np.median(e_add[v < 0.6]) * 1000) if k == 1 and (v < 0.6).any() else float('nan'))
         out[k]['_curve'] = e_add
     meta = json.load(open(run / 'metadata.json'))

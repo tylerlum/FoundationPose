@@ -120,7 +120,7 @@ def task_keys(name, model, data, arm_q, arm_d, T_bp, home):
         # tool x (handle -> tip) points down; the tip (x = +0.15) rests on the screw head (top ~16 mm up)
         def pose(th, lift=0.0):
             x = np.array([0, 0, -1.0]); y = _rz(th) @ np.array([1.0, 0, 0]); z = np.cross(x, y)
-            return T_of(np.stack([x, y, z], 1), wp + [0, 0, 0.016 + 0.15 + 0.002 + lift])
+            return T_of(np.stack([x, y, z], 1), wp + [0, 0, 0.040 + 0.15 + 0.002 + lift])   # head top at +40 mm
         cands = sorted(((reach(pose(th)) + reach(pose(th + np.pi / 2)), th) for th in np.radians(np.arange(0, 360, 30))))
         th0 = cands[0][1]
         print(f'screw_task: start angle {np.degrees(th0):.0f} deg (IK err {cands[0][0]:.3f})')
@@ -135,7 +135,7 @@ def task_keys(name, model, data, arm_q, arm_d, T_bp, home):
         # wrench flat (tool z up), jaws (x ~ +0.105) around the bolt head; swing +-40 deg about the bolt axis
         def pose(ph, lift=0.0):
             x = _rz(ph) @ np.array([1.0, 0, 0]); z = np.array([0, 0, 1.0]); y = np.cross(z, x)
-            return T_of(np.stack([x, y, z], 1), wp + [0, 0, 0.006 + lift] - 0.105 * x)
+            return T_of(np.stack([x, y, z], 1), wp + [0, 0, 0.034 + lift] - 0.105 * x)   # head centre at +34 mm
         cands = sorted(((reach(pose(ph - np.radians(40))) + reach(pose(ph + np.radians(40))), ph)
                         for ph in np.radians(np.arange(0, 360, 30))))
         ph0 = cands[0][1]

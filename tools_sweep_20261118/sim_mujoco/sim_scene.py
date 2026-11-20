@@ -38,6 +38,7 @@ CAM = os.environ.get('FPSIM_CAM', 'zed2_172707')
 #   screw : 4-colour fin screwdriver (round_screwdriver_p1_fin_quad) + screw head (fixed)
 #   wrench: open wrench 18 (red) + thick bolt head (fixed)
 KIT = HERE / 'assets_kit'
+WP_COLUMN_TOP = {'screw_p1_head_bluegrey': 0.0239, 'bolt_thick_head_bluegrey': 0.0279}   # head mesh z min (m)
 TASK = os.environ.get('FPSIM_TASK', 'sweep')
 TASKS = {
     'sweep': dict(tool=None, wp=None,
@@ -142,9 +143,16 @@ def build(T_RC=None, cube_xy=(0.10, -0.90), robot_visuals='training'):
     else:
         # fixed workpiece (column frame: origin on the turning axis, 1 mm above the table, +z up)
         cb = wb.add_body(name='cube', pos=[*tk['wp_xy'], TABLE_TOP + 0.001])
-        for k, (f, rgba) in enumerate(json.load(open(KIT / tk['wp'] / 'parts.json'))):
+        parts = json.load(open(KIT / tk['wp'] / 'parts.json'))
+        for k, (f, rgba) in enumerate(parts):
             spec.add_mesh(name=f'cube_mesh_{k}', file=str(KIT / tk['wp'] / os.path.basename(f)))
             cb.add_geom(name=f'cube_geom_{k}', type=mujoco.mjtGeom.mjGEOM_MESH, meshname=f'cube_mesh_{k}', rgba=rgba)
+        # the kit's column under the head (the head mesh starts 24-28 mm above its origin): a separate, untracked body
+        # so the head does not float over the table (stereo depth would blend head and table)
+        top = WP_COLUMN_TOP[tk['wp']]
+        col = wb.add_body(name='wp_column', pos=[*tk['wp_xy'], TABLE_TOP + 0.001 + top / 2])
+        col.add_geom(name='wp_column_geom', type=mujoco.mjtGeom.mjGEOM_CYLINDER, size=[0.015, top / 2, 0],
+                     rgba=[0.62, 0.64, 0.66, 1])
 
     for name, off in (('zed_left', 0.0), ('zed_right', BASELINE)):
         cam = wb.add_camera(name=name)

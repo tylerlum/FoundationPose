@@ -39,9 +39,17 @@ declare -A CFG=(
   [v4hctb]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2 --lost_text_redetect --redetect_prompt red_brush"
   [v4hcx]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2 @RSF@"
   [v4hcxb]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2 @RSF@"
+  [plaincal]="@CAL@"
+  [v4npcal]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor @CAL@"
+  [gen]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2 --sym_axes auto"
+  [genb]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2 --sym_axes auto"
+  [genx]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2 --sym_axes auto @RSF@"
+  [v4hcxv]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2 @RSF@ --reseed_min_cover 0.5"
+  [genm]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2 --sym_axes auto --mask_obj1_for_obj2"
+  [genmb]="--sam2_tool --sam2_image_size 640 --sam2_async --sam2_every 2 --lost_metric cover --lost_try_anchor --hand_check replay @CAL@ --catchup_iter 4 --rereg_rot_subsample 3 --lost_max_cooldown_s 2 --sym_axes auto --mask_obj1_for_obj2"
   [v4_sync]="--sam2_tool --sam2_image_size 640 --sam2_every 2 --lost_metric cover --lost_try_anchor"
 )
-suffix=""; [ "$RP" = replay_gtdepth ] && suffix=_gt; [ -n "$RT" ] && [ "$RT" != "0" ] && suffix="${suffix}_rt"
+suffix=""; [ "$RP" = replay_gtdepth ] && suffix=_gt; [ "$RP" = replay_fsit8 ] && suffix=_it8; [ -n "$RT" ] && [ "$RT" != "0" ] && suffix="${suffix}_rt"
 for name in $CFGS; do
   out=$S/runs/$TAKE$suffix/$name; rm -rf "$out"; mkdir -p "$out"
   # meshes per task (the tracker flags are the same for every task)

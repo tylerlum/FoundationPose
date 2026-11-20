@@ -917,6 +917,14 @@ def _build_parser():
                         help='Released when the nearest 10%% of SAM2\'s mask (3D) is this far from the grasp centre for '
                              '5 checks in a row.')
     parser.add_argument('--hand_frames', type=int, default=3)
+    parser.add_argument('--sym_axes', type=str, default='',
+                        help='(19 Nov) Mesh axes (subset of xyz) about which object 1 looks the same turned 180 deg '
+                             '(e.g. x for the flat wrench). After a (re-)registration, keep the twin closest to the last '
+                             'trusted orientation (first registration: the twin whose +z points most up), so the published '
+                             'frame does not jump between look-alike poses. Empty = off.')
+    parser.add_argument('--mask_obj1_for_obj2', action='store_true',
+                        help='(19 Nov) Track object 2 on depth with object 1 (the held tool, at its current pose, dilated '
+                             '3 px) blanked, so the workpiece cannot latch onto the tool touching it. Needs --sam2_tool.')
     parser.add_argument('--catchup_iter', type=int, default=0,
                         help='(19 Nov) Track iterations on the first frame after a re-registration (the tool moved '
                              'while register() blocked). 0 = normal --track_refine_iter.')
@@ -985,6 +993,9 @@ def _build_parser():
                         help='PoseStamped (robot frame) to restart FoundationPose from when lost, e.g. '
                              '/robot_frame/tool_pose_node (the node with --tool_hand_hold_s). Needs --calibration.')
     parser.add_argument('--reseed_max_age_s', type=float, default=0.2)
+    parser.add_argument('--reseed_min_cover', type=float, default=0.0,
+                        help='With --reseed_topic/--reseed_file: use the other camera\'s pose only if at least this '
+                             'fraction of this camera\'s SAM2 mask falls inside its silhouette (0 = always use it).')
     parser.add_argument('--reseed_file', type=str, default=None,
                         help='(19 Nov, replay) the other camera\'s object-1 poses as an .npz (stamps ns, T_robot Nx4x4; '
                              'tools_sweep_20261118/sim_mujoco/export_robot_poses.py). Used like --reseed_topic: when '
@@ -1510,6 +1521,42 @@ def main():
         def _forced(o):
             return args.force_upright and o.upright
 
+        def _sym_canonical(o, pose):
+            """Among pose and its 180-degree twins about --sym_axes (mesh frame), keep the one closest to the last
+            trusted orientation (or, first time, with +z most up); restarts FoundationPose's state from it."""
+            from scipy.spatial.transform import Rotation as _Rs
+            import robust_tool as _rt_s
+            cands = [pose]
+            for ax in args.sym_axes:
+                F = np.eye(4)
+                F[:3, :3] = _Rs.from_euler(ax, 180, degrees=True).as_matrix()
+                cands.append(pose @ F)
+            ref = robust_state_ref['R']
+            if ref is not None:
+                score = [-np.degrees(_Rs.from_matrix(ref.T @ c[:3, :3]).magnitude()) for c in cands]
+            else:
+                score = [float(c[:3, 2] @ up_cam) for c in cands]
+            b = int(np.argmax(score))
+            if b == 0:
+                return pose
+            T = cands[b]
+            pl = _rt_s.pose_last_from_pose(T, o.est.model_center)
+            o.est.pose_last = torch.as_tensor(pl, device=o.est.pose_last.device,
+                                              dtype=o.est.pose_last.dtype).reshape(o.est.pose_last.shape)
+            print(f'[sym] object 1: kept the 180-degree twin about {args.sym_axes[b - 1]} '
+                  f'({"closest to the last trusted pose" if ref is not None else "+z up"})', flush=True)
+            return T
+
+        robust_state_ref = dict(R=None)
+        # --sym_axes auto: per-mesh look-alike axes (a <mesh>.sym file next to the mesh wins), so one command serves
+        # every task
+        _SYM_TABLE = {'open_wrench_18_red': 'x', 'open_wrench_18': 'x', 'open_wrench_18_twotone': ''}
+        if args.sym_axes == 'auto':
+            _mp = Path(objs[0].mesh_path)
+            _sf = Path(str(_mp) + '.sym')
+            args.sym_axes = (_sf.read_text().strip() if _sf.is_file() else _SYM_TABLE.get(_mp.stem, ''))
+            print(f'[sym] object 1 ({_mp.stem}): look-alike axes {args.sym_axes or "none"}', flush=True)
+
         def _register(o, rgb, depth, mask, fast=False):
             """est.register(); for an upright part keep the copy whose +z
             points up, turning FoundationPose's own state over so track_one()
@@ -1552,6 +1599,8 @@ def main():
                 o.n_turned += 1
                 print(f'[upright {o.k + 1}] registered upside down; turned '
                       'it over (+z now up)', flush=True)
+            if o.k == 0 and args.sym_axes:
+                pose = _sym_canonical(o, pose)
             return pose
 
         rgb, depth, ts0, _, _ = fetch()
@@ -2077,6 +2126,10 @@ def main():
                             c['lost'] = True
                             row['lost'] = True
                             row['why'] = 'hand'
+                if (args.sym_axes and c.get('usable') and not c['bad'] and not c['lost']
+                        and (c.get('cover') or 0) >= 0.85 and (c.get('iou') or 0) >= 0.6
+                        and not (_hand['held'] and _hand['n_far'] > 0)):
+                    robust_state_ref['R'] = np.array(o.pose)[:3, :3].copy()   # trusted orientation for --sym_axes
                 if c['lost']:
                     robust_state['n_lost'] += 1
                 if (c['lost'] and args.lost_action == 'reregister'
@@ -2087,6 +2140,15 @@ def main():
                         if _hc is not None and _hand_dist(T, _hc) > args.hand_max_dist:
                             T = None                  # the other camera's pose is not at the hand either
                             row['seed_skip'] = 'far from hand'
+                    if T is not None and args.reseed_min_cover > 0 and mask is not None and c.get('usable'):
+                        # (19 Nov) the other camera's pose must also explain THIS camera's SAM2 mask; a weak second
+                        # camera otherwise keeps restarting a good one from wrong poses (sim: 70% -> 39%)
+                        _sil = check.silhouette(T)
+                        _cv = float((mask & _sil).sum()) / max(int(mask.sum()), 1)
+                        row['seed_cover'] = _cv
+                        if _cv < args.reseed_min_cover:
+                            T = None
+                            row['seed_skip'] = f'cover {_cv:.2f}'
                     sam_ok = 0 < c['sam_px'] <= args.lost_mask_max_ratio * max(robust_state['mask0_px'], 1)
                     if not sam_ok and args.lost_text_redetect and T is None:
                         # SAM2's mask is empty or far too large: ask SAM3 text for a fresh one (~0.3 s)
@@ -2400,6 +2462,14 @@ def main():
                             continue        # keep (and publish again) its last pose
                         last_track_2 = t0
                     _depth_o, _fpp_row = depth, None
+                    if o.k == 1 and args.mask_obj1_for_obj2 and check is not None and objs[0].pose is not None:
+                        # (19 Nov) blank the pixels the held tool covers, so the workpiece cannot slide onto the tool
+                        # touching it (screwdriver tip on the screw, wrench jaws around the bolt)
+                        _s1 = check.silhouette(objs[0].pose)
+                        if _s1.any():
+                            _s1 = cv2.dilate(_s1.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+                            _depth_o = depth.copy()
+                            _depth_o[_s1] = 0
                     if pose_filter is not None and o.k == 0:
                         # constant-velocity start pose, every frame (19 Nov; was only on usable SAM2 frames)
                         _P = pose_filter.predict()
