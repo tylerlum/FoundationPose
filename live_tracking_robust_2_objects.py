@@ -925,6 +925,10 @@ def _build_parser():
     parser.add_argument('--mask_obj1_for_obj2', action='store_true',
                         help='(19 Nov) Track object 2 on depth with object 1 (the held tool, at its current pose, dilated '
                              '3 px) blanked, so the workpiece cannot latch onto the tool touching it. Needs --sam2_tool.')
+    parser.add_argument('--obj2_roi_stereo', action='store_true',
+                        help='(20 Nov, live fast_fs only) Also run Fast-FS on a full-resolution 384x224 crop around object 2 '
+                             '(the small workpiece) and paste that sharper depth in (~4 ms/frame). Use with '
+                             '--force_upright for the workpiece. Not tested on the real camera yet.')
     parser.add_argument('--catchup_iter', type=int, default=0,
                         help='(19 Nov) Track iterations on the first frame after a re-registration (the tool moved '
                              'while register() blocked). 0 = normal --track_refine_iter.')
@@ -1343,6 +1347,7 @@ def main():
         last_seq = 0
 
         fast_fs = None
+        roi_fs = None
         if not replay and args.depth_backend == 'fast_fs':
             fast_fs = FastFsDepth(
                 model_path=args.fast_fs_model,
@@ -1354,6 +1359,12 @@ def main():
                 fx_fp=float(K[0, 0]),
                 trt_dir=args.fast_fs_trt_dir,
             )
+            if args.obj2_roi_stereo:
+                # crops are fed at their own size (fp == fs size), so disparities are in full-resolution pixels
+                roi_fs = FastFsDepth(model_path=args.fast_fs_model, iters=args.fast_fs_iters,
+                                     max_disp=args.fast_fs_max_disp, baseline_m=baseline_m, fp_size=(384, 224),
+                                     fs_size=(384, 224), fx_fp=float(K[0, 0]), trt_dir=args.fast_fs_trt_dir)
+                print('[roi stereo] object 2 gets a full-resolution 384x224 Fast-FS crop each frame', flush=True)
             if fast_fs.backend == 'trt':
                 m = re.search(r'iters(\d+)', args.fast_fs_trt_dir or '')
                 iters_tag = f'iters{m.group(1)}' if m else 'itersN'
@@ -1380,6 +1391,22 @@ def main():
                 return a, b, ts_ns, grab_s, 0.0
             t1 = time.time()
             depth = fast_fs(a, b)
+            if roi_fs is not None and objs[1].pose is not None and np.isfinite(objs[1].pose).all():
+                # (20 Nov) sharper depth for a small workpiece: the same engine on a full-resolution 384x224 crop
+                # around object 2 (sim: screw/bolt head registration 6-9 mm -> 1.6-1.8 mm with --force_upright)
+                p = objs[1].pose[:3, 3]
+                if p[2] > 0.05:
+                    u, v = K[0, 0] * p[0] / p[2] + K[0, 2], K[1, 1] * p[1] / p[2] + K[1, 2]
+                    Hh, Ww = depth.shape
+                    if Ww >= 384 and Hh >= 224:
+                        x0 = int(np.clip(u - 192 + 60, 0, Ww - 384))   # match sits left of the point in the right image
+                        y0 = int(np.clip(v - 112, 0, Hh - 224))
+                        dr = roi_fs(a[y0:y0 + 224, x0:x0 + 384], b[y0:y0 + 224, x0:x0 + 384])
+                        inner = np.zeros(dr.shape, bool)
+                        inner[8:-8, 120:-8] = True
+                        sub = depth[y0:y0 + 224, x0:x0 + 384]
+                        ok = inner & (dr > 0)
+                        sub[ok] = dr[ok]
             return a, depth, ts_ns, grab_s, time.time() - t1
 
         scorer = ScorePredictor()
